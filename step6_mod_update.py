@@ -1,0 +1,210 @@
+import os
+import argparse
+import json
+import xml.etree.ElementTree as ET
+from llm_backend import get_llm_backend
+from step1_extract_scene import StringsLoader
+
+def load_config():
+    if os.path.exists('config.json'):
+        with open('config.json', 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+def extract_texts_from_file(file_path):
+    ext = os.path.splitext(file_path)[1].lower()
+    texts = {}
+    
+    if ext == '.xml':
+        tree = ET.parse(file_path)
+        root = tree.getroot()
+        
+        # 방식 1: <Content id="..."> 구조 (단순)
+        # 방식 2: <Content><String><Source>...</Source></String></Content> 구조 (xTranslator)
+        
+        # 먼저 모든 잠재적 '엔트리'를 찾습니다.
+        entries = root.findall('.//Content[@id]') # 방식 1
+        if not entries:
+            entries = root.findall('.//String') # 방식 2
+            
+        for entry in entries:
+            # ID 결정: id 속성 우선, 없으면 EDID+REC 조합, 그것도 없으면 인덱스
+            db_id = entry.get('id')
+            if not db_id:
+                edid = entry.find('EDID')
+                rec = entry.find('REC')
+                edid_val = edid.text if edid is not None else ""
+                rec_val = rec.text if rec is not None else ""
+                db_id = f"{edid_val}|{rec_val}" if edid_val or rec_val else f"idx_{len(texts)}"
+                
+            source = entry.find('Source')
+            dest = entry.find('Dest')
+            
+            src_text = source.text if source is not None else ""
+            dst_text = dest.text if dest is not None else ""
+            
+            if src_text or dst_text:
+                texts[db_id] = {
+                    "source": src_text,
+                    "dest": dst_text,
+                    "element": entry
+                }
+    elif ext in ['.strings', '.ilstrings', '.dlstrings']:
+        loader = StringsLoader()
+        # file_path format: modname_en.strings
+        base_name = os.path.basename(file_path)
+        lang = "en"
+        if "_" in base_name:
+            stem, lang_ext = base_name.rsplit("_", 1)
+            lang = lang_ext.split(".")[0]
+        else:
+            stem = base_name.split(".")[0]
+            
+        loader.load(os.path.dirname(file_path), stem, [lang])
+        # Combine all loaded tables
+        for list_id in range(3):
+            table = loader.tables[list_id]
+            for str_id, text in table.items():
+                texts[str(str_id)] = {
+                    "source": text,
+                    "dest": "",
+                    "element": None
+                }
+    else:
+        raise ValueError("Unsupported file format. Use .xml or .strings")
+    
+    return texts
+
+def perform_refine(texts, profile_path, config):
+    print("Mode: Refine (어투 교정)")
+    system_prompt = config.get("step6_refine_prompt", "당신은 게임 전문 번역 교정자입니다. 원문과 번역문이 주어지면, 직역체나 오락가락하는 어투(존댓말/반말 혼용)를 일관성 있고 매끄러운 한국어로 교정하세요.")
+    
+    if profile_path and os.path.exists(profile_path):
+        with open(profile_path, 'r', encoding='utf-8') as f:
+            profile_data = json.load(f)
+        system_prompt += f"\n[참고 어투 프로파일]:\n{json.dumps(profile_data, ensure_ascii=False)}"
+        print(f"Loaded profile from {profile_path}")
+
+    config["step6_refine_prompt"] = system_prompt
+    backend = get_llm_backend(config, "step6_refine_prompt")
+    
+    for db_id, data in texts.items():
+        # 교정 모드에서는 Dest가 있어야만 교정 가능
+        if not data["dest"] or data["dest"] == data["source"]: 
+            continue 
+        
+        prompt = f"원문: {data['source']}\n기존 번역본: {data['dest']}\n이를 더 자연스럽게 교정하여 결과 JSON만 반환하세요. 형식: {{\"translation\": \"교정된 텍스트\"}}"
+        result = backend.generate_content(prompt)
+        
+        if result:
+            try:
+                # Remove json blocks if present
+                result = result.replace('```json', '').replace('```', '')
+                res_json = json.loads(result)
+                data["dest"] = res_json.get("translation", data["dest"])
+                print(f"[{db_id}] Refined.")
+            except Exception as e:
+                print(f"[{db_id}] JSON Parse failed: {e}")
+
+def perform_update(texts, ref_path, config):
+    print("Mode: Update (버전 업데이트 신규 번역)")
+    system_prompt = config.get("step6_update_prompt", "당신은 게임 전문 번역가입니다. 제공된 주변 문맥(기존 번역본)을 참고하여, 새롭게 추가된 원문들의 톤앤매너를 기존 번역과 일치하게 번역하세요.")
+    
+    ref_texts = {}
+    if ref_path and os.path.exists(ref_path):
+        try:
+            ref_texts = extract_texts_from_file(ref_path)
+            print(f"Loaded {len(ref_texts)} reference strings from {ref_path}")
+        except Exception as e:
+            print(f"Failed to load reference file: {e}")
+
+    backend = get_llm_backend(config, "step6_update_prompt")
+    
+    for db_id, data in texts.items():
+        # Dest가 비어있거나 원문과 동일하면 '미번역'으로 간주하여 진행
+        if data["dest"] and data["dest"] != data["source"]: 
+            continue # 정식 번역본이 이미 있는 경우만 스킵
+            
+        if db_id in ref_texts and ref_texts[db_id]["dest"]:
+            data["dest"] = ref_texts[db_id]["dest"]
+            print(f"[{db_id}] Recovered from Reference file.")
+            continue
+            
+        prompt = f"원문: {data['source']}\n"
+        if ref_texts:
+            prompt += "참고 문맥 (기존 번역본 중 일부 생략)\n"
+        prompt += "위 원문을 한국어로 자연스럽게 번역하여 결과 JSON만 반환하세요. 형식: {{\"translation\": \"번역된 텍스트\"}}"
+        
+        result = backend.generate_content(prompt)
+        if result:
+            try:
+                result = result.replace('```json', '').replace('```', '')
+                res_json = json.loads(result)
+                data["dest"] = res_json.get("translation", data["source"])
+                print(f"[{db_id}] Translated: {data['dest']}")
+            except Exception as e:
+                print(f"[{db_id}] JSON Parse failed: {e}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Step 6: Mod & DLC Translator / Text Refiner")
+    parser.add_argument("-i", "--input", required=True, help="Input XML or Strings file")
+    parser.add_argument("-m", "--mode", choices=["refine", "update"], required=True)
+    parser.add_argument("-o", "--output", required=True, help="Target output XML file")
+    parser.add_argument("-p", "--profile", help="(Refine Mode) JSON tone profile from Step 2")
+    parser.add_argument("-r", "--reference", help="(Update Mode) Previous translated XML/Strings file")
+    
+    args = parser.parse_args()
+    config = load_config()
+    
+    texts = extract_texts_from_file(args.input)
+    print(f"Extracted {len(texts)} translation entries.")
+    
+    if args.mode == "refine":
+        perform_refine(texts, args.profile, config)
+    elif args.mode == "update":
+        perform_update(texts, args.reference, config)
+        
+    print(f"Saving to {args.output}...")
+    if args.input.endswith('.xml'):
+        tree = ET.parse(args.input)
+        root = tree.getroot()
+        
+        # 위에서 정의한 것과 동일한 방식으로 엔트리 탐색
+        entries = root.findall('.//Content[@id]')
+        if not entries:
+            entries = root.findall('.//String')
+            
+        for entry in entries:
+            db_id = entry.get('id')
+            if not db_id:
+                edid = entry.find('EDID')
+                rec = entry.find('REC')
+                edid_val = edid.text if edid is not None else ""
+                rec_val = rec.text if rec is not None else ""
+                db_id = f"{edid_val}|{rec_val}" if edid_val or rec_val else None
+            
+            if not db_id: continue # 매칭 불가
+            
+            if db_id in texts and texts[db_id]["dest"]:
+                dest = entry.find('Dest')
+                if dest is None:
+                    dest = ET.SubElement(entry, 'Dest')
+                dest.text = texts[db_id]["dest"]
+                
+        tree.write(args.output, encoding="utf-8", xml_declaration=True)
+    else:
+        # Save straight to an XML standard format anyway for compatibility
+        root = ET.Element("SSTXMLRsrc")
+        for db_id, data in texts.items():
+            content = ET.SubElement(root, "Content", attrib={"id": db_id})
+            src = ET.SubElement(content, "Source")
+            src.text = data["source"]
+            dst = ET.SubElement(content, "Dest")
+            dst.text = data["dest"]
+        tree = ET.ElementTree(root)
+        tree.write(args.output, encoding="utf-8", xml_declaration=True)
+        
+    print("Step 6 process completed.")
+
+if __name__ == "__main__":
+    main()

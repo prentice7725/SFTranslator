@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Security & Config (IMPORTANT)
+config.json
+gcp-key.json
+*.pem
+*.key
+
+# SQLite Databases
+*.sqlite
+*.sqlite3
+*.db
+
+# Temporary & Logs
+temp/
+scratch/
+*.log
+extraction_log.txt
+
+# Bethesda Mod Files
+*.esm
+*.esp
+*.ba2
+*.strings
+*.dlstrings
+*.ilstrings
+
+# Project Specific Data/Cache
+vanilla_npcs.json
+train_data_final.json
+*_dump.json
+dump.json
+priority_list.json
+*_Translated.xml
+*.progress.xml
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
