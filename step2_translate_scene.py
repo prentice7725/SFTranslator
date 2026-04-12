@@ -181,7 +181,21 @@ def translate_scene_recursive(chunk_items, backend, mod_stem, context_lines, sce
     prompt, id_map = build_scene_prompt(chunk_items, mod_stem, context_lines, scene_profile, glossary_text, rag, tone_profiles)
 
     try:
-        raw = backend.generate_content(prompt)
+        from orchestrator import TranslationOrchestrator
+        if isinstance(backend, TranslationOrchestrator):
+            # 오케스트레이터인 경우 문맥 정보를 명시적으로 분리하여 전달
+            char_profile_info = f"씬 분위기: {scene_profile.get('scene_mood', '')}\n"
+            for spk, guide in scene_profile.get("character_guidelines", {}).items():
+                char_profile_info += f"- {spk}: {guide}\n"
+                
+            context_info = ""
+            for ctx in context_lines:
+                context_info += f"[{ctx.get('Speaker')}] {ctx.get('Text')}\n"
+                
+            raw = backend.translate_with_review(prompt, context_info=context_info, char_profile=char_profile_info)
+        else:
+            raw = backend.generate_content(prompt)
+        
         res = json_repair.repair_json(raw, return_objects=True)
 
         if isinstance(res, dict):
@@ -223,9 +237,35 @@ def main():
     # llm_backend.py 의 get_llm_backend 사용
     try:
         from llm_backend import get_llm_backend
-        backend = get_llm_backend(config, "step2_prompt")
+        from orchestrator import TranslationOrchestrator
+        
+        orch_cfg = config.get("orchestrator", {})
+        if orch_cfg.get("enabled"):
+            log.info("멀티 모델 오케스트레이터 모드 활성화")
+            gen_backends = []
+            for m in orch_cfg.get("generation_models", []):
+                # 각 모델별 페르소나를 시스템 인스트럭션에 결합
+                m_config = config.copy()
+                m_config["api_provider"] = m["provider"]
+                m_config["model_name"] = m["model"]
+                persona_prompt = f"{config.get('step2_prompt', '')}\n\n[페르소나] {m['persona']}"
+                # 임시 키로 step2_prompt를 덮어씌워서 get_llm_backend가 이를 사용하게 함
+                m_config["_temp_prompt"] = persona_prompt
+                gen_backends.append(get_llm_backend(m_config, "_temp_prompt"))
+            
+            review_cfg = orch_cfg.get("review_model", {})
+            r_config = config.copy()
+            r_config["api_provider"] = review_cfg["provider"]
+            r_config["model_name"] = review_cfg["model"]
+            review_backend = get_llm_backend(r_config, "step2_prompt")
+            
+            backend = TranslationOrchestrator(gen_backends, review_backend, glossary_text=glossary_text) 
+        else:
+            backend = get_llm_backend(config, "step2_prompt")
     except Exception as e:
-        log.error(f"백엔드 초기화 실패: {e}")
+        log.error(f"백엔드 또는 오케스트레이터 초기화 실패: {e}")
+        import traceback
+        log.error(traceback.format_exc())
         return
 
     rag = DBRAG()
@@ -336,6 +376,11 @@ def main():
                 json.dump(scenes_data, f, ensure_ascii=False, indent=2)
 
     log.info("모든 작업이 완료되었습니다.")
+    
+    # 1min.ai 누적 크레딧 출력
+    from llm_backend import Min1AIBackend
+    if Min1AIBackend.total_used_credit > 0:
+        log.info(f"\n[결산] 이번 세션에서 사용된 총 1min.ai 크레딧: {Min1AIBackend.total_used_credit}")
 
 if __name__ == "__main__":
     main()

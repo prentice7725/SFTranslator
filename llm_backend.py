@@ -380,6 +380,92 @@ class LocalLLMBackend(BaseLLMBackend):
             return None
         return None
 
+import requests
+
+class Min1AIBackend(BaseLLMBackend):
+    _RETRY_KEYWORDS = ('429', 'rate_limit_exceeded', '500', '503', 'timeout', 'internal_error')
+    total_used_credit = 0  # 세션 내 누적 크레딧 추적
+
+    def __init__(self, api_key, model_name, system_instruction, max_retries=5, retry_base_wait=60):
+        super().__init__(model_name, system_instruction, max_retries, retry_base_wait)
+        self.api_key = api_key
+        self.base_url = "https://api.1min.ai/api/features"
+        self.headers = {
+            "Content-Type": "application/json",
+            "API-KEY": self.api_key
+        }
+
+    def _extract_text_response(self, data: Dict[str, Any]) -> str:
+        """1min.ai 응답 구조에서 텍스트 내용을 안전하게 추출합니다."""
+        detail = data.get("aiRecordDetail", {})
+        response_obj = detail.get("responseObject", {})
+        
+        if isinstance(response_obj, dict):
+            if "content" in response_obj and response_obj["content"]:
+                return response_obj["content"]
+            if "text" in response_obj and response_obj["text"]:
+                return response_obj["text"]
+        
+        if "result" in data and data["result"]:
+            return data["result"]
+            
+        return ""
+
+    def generate_content(self, prompt: str, temperature=0.3, max_output_tokens=8192) -> str | None:
+        payload = {
+            "type": "CHAT_WITH_AI",
+            "model": self.model_name,
+            "promptObject": {
+                "prompt": f"{self.system_instruction}\n\n{prompt}"
+            }
+        }
+        
+        last_exc = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = requests.post(self.base_url, headers=self.headers, json=payload, timeout=120)
+                
+                if response.status_code == 429:
+                    wait = min(2 ** attempt + random.random() * 5, 30)
+                    log.warning(f"1min.ai Rate Limit (429) 감지. {wait:.1f}초 대기 후 재시도...")
+                    time.sleep(wait)
+                    continue
+                    
+                response.raise_for_status()
+                data = response.json()
+                
+                # usedCredit 기록 및 누적
+                used_credit = data.get("usedCredit", 0)
+                if used_credit > 0:
+                    Min1AIBackend.total_used_credit += used_credit
+                    log.info(f"[1min.ai] Model: {self.model_name} | Batch Credit: {used_credit} | Total: {Min1AIBackend.total_used_credit}")
+
+                content = self._extract_text_response(data)
+                
+                if not content:
+                    log.warning(f"1min.ai 응답 내용이 비어 있습니다. (시도 {attempt})")
+                    raise ValueError("EMPTY_RESPONSE")
+                
+                return content
+                
+            except Exception as e:
+                err_str = str(e).lower()
+                last_exc = e
+                retry_cond = any(kw in err_str for kw in self._RETRY_KEYWORDS) or (hasattr(e, 'response') and e.response is not None and e.response.status_code in [500, 502, 503, 504])
+                
+                if retry_cond:
+                    wait = self.retry_base_wait * (2 ** (attempt - 1)) + (random.random() * 2)
+                    log.warning(f"1min.ai 일시적 오류 (시도 {attempt}), {wait:.1f}초 대기: {str(e)[:100]}")
+                    time.sleep(wait)
+                    continue
+                else:
+                    raise e
+                    
+        if last_exc: 
+            log.error("1min.ai 최대 재시도 횟수 초과. 스킵합니다.")
+            return None
+        return None
+
 def _deobfuscate(text: str) -> str:
     if not text: return text
     try:
@@ -394,8 +480,7 @@ def _deobfuscate(text: str) -> str:
 def get_llm_backend(config_dict, step_prompt_key, max_retries=3, retry_base_wait=60):
     """
     config.json 에 설정된 통신 프로바이더(`api_provider`) 값을 읽고, 
-    해당 설정에 맞는 백엔드 클래스(Vertex, Gemini, OpenAI, LocalLLM 중 하나) 인스턴스를 생성하여 반환합니다.
-    (비밀키는 간단한 XOR 난독화 처리를 통해 평문 노출을 최소화합니다)
+    해당 설정에 맞는 백엔드 클래스(Vertex, Gemini, OpenAI, LocalLLM, Min1AI 중 하나) 인스턴스를 생성하여 반환합니다.
     """
     provider = config_dict.get("api_provider", "vertexai")
     model_name = config_dict.get("model_name", "gemini-2.5-flash")
@@ -405,7 +490,6 @@ def get_llm_backend(config_dict, step_prompt_key, max_retries=3, retry_base_wait
         project_id = config_dict.get("gcp_project_id", "")
         location = config_dict.get("gcp_location", "asia-northeast1")
         
-        # 키 파일 경로가 config에 저장되어 있다면 환경변수로 즉시 등록
         key_json_path = config_dict.get("gcp_key_json", "")
         if key_json_path and os.path.exists(key_json_path):
             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_json_path
@@ -421,5 +505,9 @@ def get_llm_backend(config_dict, step_prompt_key, max_retries=3, retry_base_wait
         base_url = config_dict.get("localllm_base_url", "http://localhost:11434/v1")
         api_key = _deobfuscate(config_dict.get("localllm_api_key", ""))
         return LocalLLMBackend(base_url, api_key, model_name, system_instruction, max_retries, retry_base_wait)
+    elif provider == "1minai":
+        api_key = _deobfuscate(config_dict.get("1minai_api_key", ""))
+        return Min1AIBackend(api_key, model_name, system_instruction, max_retries, retry_base_wait)
     else:
         raise ValueError(f"Unknown API provider: {provider}")
+

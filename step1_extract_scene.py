@@ -1005,8 +1005,9 @@ class StarfieldSceneExtractor:
                     most_common = Counter(dial_speakers[pd]).most_common(1)[0][0]
                     info["_resolved_speaker"] = most_common
                 else:
-                    # Player로 무조건 퉁치지 말고, DIAL에 다른 NPC 화자가 전혀 없을 때만 추론
-                    info["_resolved_speaker"] = "Unknown"
+                    # DIAL 내에 NPC 화자가 확인되지 않는다면, 이는 플레이어의 선택지인 경우가 대부분입니다.
+                    info["_resolved_speaker"] = "Player"
+                    info["_resolved_speaker_fid"] = 7
 
         quest_groups = {}
         def get_quest_group(qid: int):

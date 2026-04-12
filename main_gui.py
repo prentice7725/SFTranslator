@@ -47,6 +47,7 @@ class ConfigManager:
             "api_provider": "gemini",
             "gemini_api_key": "",
             "openai_api_key": "",
+            "1minai_api_key": "",
             "localllm_base_url": "http://localhost:11434/v1",
             "localllm_api_key": "",
             "gcp_project_id": "project-2c984893-491f-4636-adf",
@@ -56,7 +57,17 @@ class ConfigManager:
             "rag_data_file": str(Path(__file__).parent / "train_data_final.json"),
             "step4_prompt": "당신은 베데스다 스타필드 게임의 UI, 아이템, 일지 등을 번역하는 전문가입니다. 원문의 의도를 파악하여 직관적이고 게임에 어울리는 한국어로 번역하세요. 제공된 용어집을 무조건 준수하며, 결과는 오직 JSON 배열로만 반환하십시오. 절대 다른 말을 덧붙이지 마십시오.",
             "step5_prompt": "당신은 베데스다 스타필드 게임의 UI, 아이템, 일지 등을 번역하는 전문가입니다. 원문의 의도를 파악하여 직관적이고 게임에 어울리는 한국어로 번역하세요. 제공된 용어집을 무조건 준수하며, 결과는 오직 JSON 배열로만 반환하십시오. 절대 다른 말을 덧붙이지 마십시오.",
-            "use_ja_ref": False
+            "use_ja_ref": False,
+            "auto_audio_analysis": False,
+            "pipeline_mode": "high_quality",
+            "orchestrator": {
+                "enabled": False,
+                "generation_models": [
+                    {"provider": "1minai", "model": "gpt-4o-mini", "persona": "Natural: 가장 자연스럽고 구어체적인 한국어 대사체에 집중하세요."},
+                    {"provider": "1minai", "model": "claude-3-5-sonnet", "persona": "Faithful: 원문의 의미와 문장 구조를 최대한 유지하며 오역 없는 번역에 집중하세요."}
+                ],
+                "review_model": {"provider": "vertexai", "model": "gemini-2.5-pro"}
+            }
         }
         self.load()
 
@@ -65,7 +76,7 @@ class ConfigManager:
             try:
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                     loaded = json.load(f)
-                    for k in ["gemini_api_key", "openai_api_key", "localllm_api_key"]:
+                    for k in ["gemini_api_key", "openai_api_key", "localllm_api_key", "1minai_api_key"]:
                         if k in loaded and loaded[k]:
                             loaded[k] = _deobfuscate(loaded[k])
                     self.config.update(loaded)
@@ -75,7 +86,7 @@ class ConfigManager:
     def save(self):
         try:
             to_save = dict(self.config)
-            for k in ["gemini_api_key", "openai_api_key", "localllm_api_key"]:
+            for k in ["gemini_api_key", "openai_api_key", "localllm_api_key", "1minai_api_key"]:
                 if k in to_save and to_save[k]:
                     to_save[k] = _obfuscate(to_save[k])
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -122,7 +133,8 @@ class WorkerThread(QThread):
                 "Step5": "step5_review_xml.py",
                 "Step6": "step6_mod_update.py",
                 "AudioExtract": "extract_audio.py",
-                "AudioProfile": "audition_profiler.py"
+                "AudioProfile": "audition_profiler.py",
+                "AutoPipeline": "auto_pipeline.py"
             }
             script_file = script_map.get(self.step)
             if not script_file:
@@ -142,7 +154,11 @@ class WorkerThread(QThread):
                 if self.kwargs.get("profile_only"):
                     cmd.append("--profile-only")
                 if self.kwargs.get("use_ja_ref"):
-                    cmd.append("--use-ja-ref")
+                    cmd.append("--use_ja_ref")
+            elif self.step == "AutoPipeline":
+                cmd.extend(["-i", self.kwargs["input"]])
+                if self.kwargs.get("config"):
+                    cmd.extend(["-c", self.kwargs["config"]])
             elif self.step == "Step3":
                 if self.kwargs.get("merge_xml"):
                     # XML 머지 모드: --merge-xml <기존xml> -t <json> [-o <출력xml>]
@@ -249,7 +265,7 @@ class MainApp(QMainWindow):
         self.tabs = QTabWidget()
         self.main_layout.addWidget(self.tabs)
 
-        # 탭 생성
+        self.tabs.addTab(self.create_auto_pipeline_tab(), "🚀 원클릭 자동 번역")
         self.tabs.addTab(self.create_settings_tab(), "공통 설정")
         self.tabs.addTab(self.create_db_manager_tab(), "DB 관리 (용어+TM)")
         self.tabs.addTab(self.create_step1_tab(), "Step 1: Scene 추출")
@@ -262,12 +278,86 @@ class MainApp(QMainWindow):
 
         self.status_log = QTextEdit()
         self.status_log.setReadOnly(True)
-        self.status_log.setMinimumHeight(250)  # 로그 초기 크기 확대
+        self.status_log.setMinimumHeight(250)
         self.main_layout.addWidget(QLabel("통합 로그:"), 0)
-        self.main_layout.addWidget(self.status_log, 1) # 로그 창에 스트레치 부여
+        self.main_layout.addWidget(self.status_log, 1)
 
     def append_log(self, text):
         self.status_log.append(text)
+
+    # ==========================
+    # 0. 자동화 파이프라인 탭
+    # ==========================
+    def create_auto_pipeline_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        banner = QLabel("🌌 Starfield Mod 원클릭 자동 번역 시스템")
+        banner.setStyleSheet("font-size: 18px; font-weight: bold; color: #1e88e5; margin: 10px;")
+        layout.addWidget(banner)
+
+        desc = QLabel("번역할 모드 파일(ESM/ESP)을 선택하면, 대화 유무를 자동으로 판단하여\n추출부터 최종 XML 생성까지 모든 단계를 한 번에 처리합니다.")
+        desc.setStyleSheet("color: #555; margin-bottom: 20px;")
+        layout.addWidget(desc)
+
+        group = QGroupBox("자동화 설정")
+        form = QFormLayout(group)
+
+        self.auto_input_path = QLineEdit()
+        btn_browse = QPushButton("모드 파일 찾기")
+        btn_browse.clicked.connect(self.browse_auto_input)
+        row1 = QHBoxLayout()
+        row1.addWidget(self.auto_input_path)
+        row1.addWidget(btn_browse)
+        form.addRow("대상 기가바이트 파일 (.esm / .esp):", row1)
+
+        self.auto_mode_cb = QComboBox()
+        self.auto_mode_cb.addItems(["high_quality (다중 모델 후보 생성/감수)", "fast (단일 모델 고속 번역)"])
+        self.auto_mode_cb.setCurrentIndex(0 if self.config_mgr.config.get("pipeline_mode") == "high_quality" else 1)
+        form.addRow("번역 품질 설정:", self.auto_mode_cb)
+
+        self.auto_audio_check = QCheckBox("대화 발견 시 자동으로 음성 분석 및 프로파일 생성")
+        self.auto_audio_check.setChecked(self.config_mgr.config.get("auto_audio_analysis", False))
+        form.addRow("오디오 연동:", self.auto_audio_check)
+
+        layout.addWidget(group)
+
+        self.auto_start_btn = QPushButton("🚀 자동 번역 파이프라인 시작")
+        self.auto_start_btn.setMinimumHeight(50)
+        self.auto_start_btn.setStyleSheet("background-color: #1976d2; color: white; font-size: 16px; font-weight: bold;")
+        self.auto_start_btn.clicked.connect(self.run_auto_pipeline)
+        
+        self.auto_stop_btn = QPushButton("정지")
+        self.auto_stop_btn.setEnabled(False)
+        self.auto_stop_btn.clicked.connect(self.stop_current_task)
+
+        h_btn = QHBoxLayout()
+        h_btn.addWidget(self.auto_start_btn)
+        h_btn.addWidget(self.auto_stop_btn)
+        layout.addLayout(h_btn)
+
+        layout.addStretch()
+        return widget
+
+    def browse_auto_input(self):
+        path, _ = QFileDialog.getOpenFileName(self, "모드 파일 선택", "", "Bethesda Plugin Files (*.esm *.esp);;All Files (*)")
+        if path:
+            self.auto_input_path.setText(path)
+
+    def run_auto_pipeline(self):
+        if not self.auto_input_path.text():
+            QMessageBox.warning(self, "경고", "번역할 모드 파일을 먼저 선택하세요.")
+            return
+
+        # 설정 업데이트
+        self.config_mgr.config["auto_audio_analysis"] = self.auto_audio_check.isChecked()
+        self.config_mgr.config["pipeline_mode"] = "high_quality" if self.auto_mode_cb.currentIndex() == 0 else "fast"
+        self.config_mgr.save()
+
+        self.run_background_task("AutoPipeline", {
+            "input": self.auto_input_path.text(),
+            "config": "config.json"
+        }, self.auto_stop_btn)
 
     # ==========================
     # 1. 공통 설정 탭
@@ -280,8 +370,8 @@ class MainApp(QMainWindow):
         self.settings_form = form
 
         self.api_provider_combo = QComboBox()
-        self.api_provider_combo.addItems(["vertexai", "gemini", "openai", "localllm"])
-        if self.config_mgr.config.get("api_provider", "gemini") in ["vertexai", "gemini", "openai", "localllm"]:
+        self.api_provider_combo.addItems(["vertexai", "gemini", "openai", "localllm", "1minai"])
+        if self.config_mgr.config.get("api_provider", "gemini") in ["vertexai", "gemini", "openai", "localllm", "1minai"]:
             self.api_provider_combo.setCurrentText(self.config_mgr.config.get("api_provider", "gemini"))
         self.api_provider_combo.currentTextChanged.connect(self.on_provider_changed)
 
@@ -290,6 +380,9 @@ class MainApp(QMainWindow):
         
         self.openai_key_input = QLineEdit(self.config_mgr.config.get("openai_api_key", ""))
         self.openai_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+
+        self.min1ai_key_input = QLineEdit(self.config_mgr.config.get("1minai_api_key", ""))
+        self.min1ai_key_input.setEchoMode(QLineEdit.EchoMode.Password)
         
         self.gcp_id_input = QLineEdit(self.config_mgr.config.get("gcp_project_id", ""))
         self.gcp_loc_input = QLineEdit(self.config_mgr.config.get("gcp_location", ""))
@@ -310,6 +403,7 @@ class MainApp(QMainWindow):
         form.addRow("API 지원 모드 (Provider):", self.api_provider_combo)
         form.addRow("Gemini API Key:", self.gemini_key_input)
         form.addRow("OpenAI API Key:", self.openai_key_input)
+        form.addRow("1min.ai API Key:", self.min1ai_key_input)
         form.addRow("GCP Project ID (Vertex AI 전용):", self.gcp_id_input)
         form.addRow("GCP Location (Vertex AI 전용):", self.gcp_loc_input)
         form.addRow("GCP Key JSON Path:", self.row_gcp_key)
@@ -317,7 +411,6 @@ class MainApp(QMainWindow):
         form.addRow("Local LLM API Key:", self.localllm_api_key_input)
         form.addRow("Model Name:", self.model_combo)
         
-        # 모델 목록과 동적 UI 숨김/표시 초기화
         self.on_provider_changed(self.api_provider_combo.currentText())
         
         current_model = self.config_mgr.config.get("model_name", "gemini-2.5-flash")
@@ -326,9 +419,28 @@ class MainApp(QMainWindow):
         else:
             self.model_combo.setCurrentText(current_model)
         
-        # Glossary JSON과 RAG Data JSON은 SQLite DB 전환으로 인해 공통 설정 UI에서 제거되었습니다.
-
         layout.addLayout(form)
+
+        orch_group = QGroupBox("멀티 모델 오케스트레이터 (Orchestrator) 설정")
+        orch_layout = QVBoxLayout()
+        
+        self.orch_enabled_check = QCheckBox("오케스트레이터 활성화 (다중 모델 후보 생성 + 수석 에디터 감수)")
+        orch_data = self.config_mgr.config.get("orchestrator", {})
+        self.orch_enabled_check.setChecked(orch_data.get("enabled", False))
+        orch_layout.addWidget(self.orch_enabled_check)
+        
+        self.orch_config_edit = QTextEdit()
+        self.orch_config_edit.setPlaceholderText("오케스트레이터 세부 설정 (JSON)")
+        self.orch_config_edit.setPlainText(json.dumps({
+            "generation_models": orch_data.get("generation_models", []),
+            "review_model": orch_data.get("review_model", {})
+        }, ensure_ascii=False, indent=2))
+        self.orch_config_edit.setMaximumHeight(150)
+        orch_layout.addWidget(QLabel("세부 모델 설정 (JSON 구조):"))
+        orch_layout.addWidget(self.orch_config_edit)
+        
+        orch_group.setLayout(orch_layout)
+        layout.addWidget(orch_group)
 
         save_btn = QPushButton("설정 저장")
         save_btn.clicked.connect(self.save_settings)
@@ -363,6 +475,7 @@ class MainApp(QMainWindow):
             "vertexai": [self.gcp_id_input, self.gcp_loc_input, self.gcp_key_path_input, self.gcp_key_btn],
             "gemini": [self.gemini_key_input],
             "openai": [self.openai_key_input],
+            "1minai": [self.min1ai_key_input],
             "localllm": [self.localllm_base_url_input, self.localllm_api_key_input]
         }
         
@@ -371,9 +484,8 @@ class MainApp(QMainWindow):
                 is_visible = (prov == provider)
                 for w in widgets:
                     w.setVisible(is_visible)
-                    # QHBoxLayout 내부의 위젯인 경우 부모 레이아웃의 레이블까지 처리해야 할 수 있음
                     label = self.settings_form.labelForField(w)
-                    if not label: # 레이아웃 내 위젯이거나 레이아웃 직접 참조인 경우
+                    if not label: 
                         if w == self.gcp_key_path_input:
                              label = self.settings_form.labelForField(self.row_gcp_key)
                     if label:
@@ -381,6 +493,8 @@ class MainApp(QMainWindow):
 
         if provider == "openai":
             self.model_combo.addItems(["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "o1-mini", "o3-mini"])
+        elif provider == "1minai":
+            self.model_combo.addItems(["gpt-4o-mini", "claude-3-5-sonnet", "gemini-1.5-pro", "gpt-4o"])
         elif provider == "localllm":
             self.model_combo.addItems(["hugging-quants/Meta-Llama-3.1-70B-Instruct-AWQ-INT4", "gemma-2", "qwen-2.5", "deepseek-r1"])
         elif provider == "vertexai":
@@ -392,15 +506,24 @@ class MainApp(QMainWindow):
         self.config_mgr.config["api_provider"] = self.api_provider_combo.currentText()
         self.config_mgr.config["gemini_api_key"] = self.gemini_key_input.text()
         self.config_mgr.config["openai_api_key"] = self.openai_key_input.text()
+        self.config_mgr.config["1minai_api_key"] = self.min1ai_key_input.text()
         self.config_mgr.config["localllm_base_url"] = self.localllm_base_url_input.text()
         self.config_mgr.config["localllm_api_key"] = self.localllm_api_key_input.text()
         self.config_mgr.config["gcp_project_id"] = self.gcp_id_input.text()
         self.config_mgr.config["gcp_location"] = self.gcp_loc_input.text()
         self.config_mgr.config["gcp_key_json"] = self.gcp_key_path_input.text()
         self.config_mgr.config["model_name"] = self.model_combo.currentText()
-        # self.config_mgr.config["glossary_file"] 와 "rag_data_file" 저장 삭제됨
         
-        # 시스템 프롬프트가 로드/생성된 이후라면 함께 덮어씀
+        try:
+            orch_json = json.loads(self.orch_config_edit.toPlainText())
+            self.config_mgr.config["orchestrator"] = {
+                "enabled": self.orch_enabled_check.isChecked(),
+                "generation_models": orch_json.get("generation_models", []),
+                "review_model": orch_json.get("review_model", {})
+            }
+        except Exception as e:
+            self.append_log(f"오케스트레이터 JSON 파싱 오류: {e}")
+
         if hasattr(self, 'step4_prompt_edit'):
             self.config_mgr.config["step4_prompt"] = self.step4_prompt_edit.toPlainText()
         if hasattr(self, 'step5_prompt_edit'):
@@ -411,14 +534,10 @@ class MainApp(QMainWindow):
         self.append_log("모든 설정 및 프롬프트가 저장되었습니다.")
         QMessageBox.information(self, "알림", "모든 설정 및 프롬프트가 저장되었습니다.")
 
-    # ==========================
-    # DB 관리 탭 (용어집 & 번역 메모리)
-    # ==========================
     def create_db_manager_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
         
-        # 상단 (테이블 콤보박스 및 검색)
         top_layout = QHBoxLayout()
         self.db_table_combo = QComboBox()
         self.db_table_combo.addItems(["glossary", "translation_memory", "npc_names"])
@@ -435,7 +554,6 @@ class MainApp(QMainWindow):
         
         layout.addLayout(top_layout)
         
-        # 테이블
         self.db_table = QTableWidget()
         self.db_table.setColumnCount(3)
         self.db_table.setHorizontalHeaderLabels(["ID (읽기전용)", "영어 (English)", "한국어 (Korean)"])
@@ -444,7 +562,6 @@ class MainApp(QMainWindow):
         self.db_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         layout.addWidget(self.db_table)
         
-        # 하단 조작 버튼
         bot_layout = QHBoxLayout()
         add_btn = QPushButton("새 항목 추가 (최하단)")
         del_btn = QPushButton("선택 행 삭제")
@@ -455,7 +572,6 @@ class MainApp(QMainWindow):
         
         layout.addLayout(bot_layout)
         
-        # 이벤트 연결
         self.db_table_combo.currentTextChanged.connect(self.load_db_data)
         search_btn.clicked.connect(self.load_db_data)
         add_btn.clicked.connect(self.add_db_row)
@@ -473,13 +589,11 @@ class MainApp(QMainWindow):
 
     def load_db_data(self):
         table = self.db_table_combo.currentText()
-        # SQL Injection 방지: 허용된 테이블 이름만 허용
         if table not in ("glossary", "translation_memory", "npc_names"):
             return
             
         search_query = self.db_search_input.text().strip()
         
-        # 테이블별 컬럼명 및 헤더 매핑
         col_map = {
             "glossary": ("english", "korean", ["ID (읽기전용)", "영어 (English)", "한국어 (Korean)"]),
             "translation_memory": ("english", "korean", ["ID (읽기전용)", "영어 (English)", "한국어 (Korean)"]),
@@ -498,7 +612,7 @@ class MainApp(QMainWindow):
                 like_term = f"%{search_query}%"
                 params = (like_term, like_term)
             
-            query += " ORDER BY id DESC LIMIT 1000" # 성능 고려 (1000개 제한)
+            query += " ORDER BY id DESC LIMIT 1000"
             c.execute(query, params)
             rows = c.fetchall()
             conn.close()
