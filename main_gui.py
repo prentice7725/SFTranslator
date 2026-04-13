@@ -351,7 +351,14 @@ class MainApp(QMainWindow):
 
         # 설정 업데이트
         self.config_mgr.config["auto_audio_analysis"] = self.auto_audio_check.isChecked()
-        self.config_mgr.config["pipeline_mode"] = "high_quality" if self.auto_mode_cb.currentIndex() == 0 else "fast"
+        mode = "high_quality" if self.auto_mode_cb.currentIndex() == 0 else "fast"
+        self.config_mgr.config["pipeline_mode"] = mode
+        
+        # 오케스트레이터 설정 동기화: fast 모드면 오케스트레이터 비활성화
+        if "orchestrator" not in self.config_mgr.config:
+            self.config_mgr.config["orchestrator"] = {"enabled": True}
+        
+        self.config_mgr.config["orchestrator"]["enabled"] = (mode == "high_quality")
         self.config_mgr.save()
 
         self.run_background_task("AutoPipeline", {

@@ -51,11 +51,33 @@ def run_profiling(config_path, priority_list_path, audition_dir, output_profile_
     with open(priority_list_path, "r", encoding="utf-8") as f:
         priority_list = json.load(f)
 
-    # Gemini 백엔드 초기화 (오디오 지원을 위해 Gemini/Vertex 강제 또는 체크 필요)
-    from llm_backend import GeminiBackend, VertexBackend
+    # 4. 데이터 형식 보정 (List of Quests vs Dict of Speakers)
+    if isinstance(priority_list, list):
+        log.info("Detected Quest List format. Grouping speaker contexts...")
+        grouped = {}
+        def _collect(dialogues):
+            for d in dialogues:
+                spk = d.get("Speaker", "Unknown")
+                path = d.get("AudioPath")
+                txt = d.get("Text", "").strip()
+                if spk and txt:
+                    if spk not in grouped: grouped[spk] = []
+                    # 중복 방지 (텍스트 위주)
+                    if not any(x["Text"] == txt for x in grouped[spk]):
+                        grouped[spk].append({"AudioPath": path, "Text": txt})
+        
+        for q in priority_list:
+            for s in q.get("Scenes", []):
+                for d in s.get("Dials", []):
+                    _collect(d.get("Dialogues", []))
+            for d in q.get("StandaloneDials", []):
+                _collect(d.get("Dialogues", []))
+        priority_list = grouped
+
+    # 백엔드 초기화 (오디오 지원 여부 확인)
     backend = get_llm_backend(config, "system_prompt_step2")
-    if not isinstance(backend, (GeminiBackend, VertexBackend)):
-        log.error("Audition profiling requires Gemini API (GeminiBackend or VertexBackend).")
+    if not hasattr(backend, "generate_with_audio"):
+        log.error(f"Selected backend ({type(backend).__name__}) does not support audio modality.")
         return
 
     tone_profiles = {}
@@ -82,7 +104,11 @@ def run_profiling(config_path, priority_list_path, audition_dir, output_profile_
         # 샘플 중 하나만 사용하여 오디오 특징 파악 (변환 및 프로파일링)
         profile_text = ""
         for sample in samples:
-            wem_name = os.path.basename(sample["AudioPath"])
+            audio_path = sample.get("AudioPath")
+            if not audio_path:
+                continue
+
+            wem_name = os.path.basename(audio_path)
             wem_path = os.path.join(speaker_audition_dir, wem_name)
             wav_path = wem_path.replace(".wem", ".wav")
             
