@@ -452,36 +452,43 @@ def main():
                 config = json.load(_f)
         except Exception:
             pass
-    from orchestrator import TranslationOrchestrator
-    orch_cfg = config.get("orchestrator", {})
-    if orch_cfg.get("enabled"):
-        log.info("Step 4: 멀티 모델 오케스트레이터 모드 활성화")
-        gen_backends = []
-        glossary_dict = load_glossary_db()
-        glossary_text = "\n".join([f"- {k}: {v}" for k, v in glossary_dict.items()])
-        
-        for m in orch_cfg.get("generation_models", []):
-            m_config = config.copy()
-            m_config["api_provider"] = m["provider"]
-            m_config["model_name"] = m["model"]
-            persona_prompt = f"{config.get('step4_prompt', '')}\n\n[페르소나] {m['persona']}"
-            m_config["_temp_prompt"] = persona_prompt
-            gen_backends.append(get_llm_backend(m_config, "_temp_prompt"))
-        
-        review_cfg = orch_cfg.get("review_model", {})
-        r_config = config.copy()
-        r_config["api_provider"] = review_cfg["provider"]
-        r_config["model_name"] = review_cfg["model"]
-        review_backend = get_llm_backend(r_config, "step4_prompt")
-        
-        backend = TranslationOrchestrator(gen_backends, review_backend, glossary_text=glossary_text)
-    else:
-        backend = get_llm_backend(
-            config,
-            "step4_prompt",
-            max_retries=Config.MAX_RETRIES,
-            retry_base_wait=Config.RETRY_BASE_WAIT,
-        )
+    try:
+        from orchestrator import TranslationOrchestrator
+        orch_cfg = config.get("orchestrator", {})
+        if orch_cfg.get("enabled"):
+            log.info("Step 4: 멀티 모델 오케스트레이터 모드 활성화")
+            gen_backends = []
+            glossary_dict = load_glossary_db()
+            glossary_text = "\n".join([f"- {k}: {v}" for k, v in glossary_dict.items()])
+            
+            for m in orch_cfg.get("generation_models", []):
+                m_config = config.copy()
+                m_config["api_provider"] = m["provider"]
+                m_config["model_name"] = m["model"]
+                persona_prompt = f"{config.get('step4_prompt', '')}\n\n[페르소나] {m['persona']}"
+                m_config["_temp_prompt"] = persona_prompt
+                gen_backends.append(get_llm_backend(m_config, "_temp_prompt"))
+            
+            review_cfg = orch_cfg.get("review_model", {})
+            r_config = config.copy()
+            r_config["api_provider"] = review_cfg["provider"]
+            r_config["model_name"] = review_cfg["model"]
+            review_backend = get_llm_backend(r_config, "step4_prompt")
+            
+            backend = TranslationOrchestrator(gen_backends, review_backend, glossary_text=glossary_text)
+        else:
+            backend = get_llm_backend(
+                config,
+                "step4_prompt",
+                max_retries=Config.MAX_RETRIES,
+                retry_base_wait=Config.RETRY_BASE_WAIT,
+            )
+    except Exception as e:
+        log.error(f"백엔드 또는 오케스트레이터 초기화 실패: {e}")
+        import traceback
+        log.error(traceback.format_exc())
+        import sys
+        sys.exit(1)
 
     # 모드 이름 결정
     mod_stem = args.mod_name

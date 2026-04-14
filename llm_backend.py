@@ -589,12 +589,13 @@ def _deobfuscate(text: str) -> str:
         return text
 
 def get_llm_backend(config_dict, step_prompt_key, max_retries=3, retry_base_wait=60):
-    """
-    config.json 에 설정된 통신 프로바이더(`api_provider`) 값을 읽고, 
-    해당 설정에 맞는 백엔드 클래스(Vertex, Gemini, OpenAI, LocalLLM, Min1AI 중 하나) 인스턴스를 생성하여 반환합니다.
-    """
     provider = config_dict.get("api_provider", "vertexai")
-    model_name = config_dict.get("model_name", "gemini-2.5-flash")
+    
+    # [보강] vertexai_gemini 등의 별칭도 vertexai 공식 명칭으로 매핑
+    if str(provider).lower() in ["vertexai_gemini", "vertex_ai", "google"]:
+        provider = "vertexai"
+
+    model_name = config_dict.get("model_name", "gemini-3-flash-preview")
     system_instruction = config_dict.get(step_prompt_key, "")
     
     if provider == "vertexai":

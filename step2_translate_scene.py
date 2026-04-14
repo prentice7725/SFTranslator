@@ -234,6 +234,9 @@ def main():
 
     config = load_config()
     
+    glossary_dict = load_glossary_db()
+    glossary_text = "\n".join([f"- {k}: {v}" for k, v in glossary_dict.items()])
+    
     # llm_backend.py 의 get_llm_backend 사용
     try:
         from llm_backend import get_llm_backend
@@ -266,11 +269,10 @@ def main():
         log.error(f"백엔드 또는 오케스트레이터 초기화 실패: {e}")
         import traceback
         log.error(traceback.format_exc())
-        return
+        import sys
+        sys.exit(1)
 
     rag = DBRAG()
-    glossary_dict = load_glossary_db()
-    glossary_text = "\n".join([f"- {k}: {v}" for k, v in glossary_dict.items()])
 
     in_path = Path(args.input)
     out_path = Path(args.output)
