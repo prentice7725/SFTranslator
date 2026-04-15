@@ -186,7 +186,11 @@ def build_scene_prompt(chunk_items, mod_stem, context_lines, scene_profile, glos
 1. NPC는 지정된 말투를 끝까지 고수할 것. 
 2. 단, 'Player'는 상대와 상황에 따라 말투를 유연하게 바꿀 것.
 3. 용어집 준수: {glossary_text}
-4. 결과는 오직 JSON: {{ "BatchID": "번역문" }}
+4. 무조건 아래 JSON 형식으로만 응답할 것. 추가적인 부연 설명은 절대 금지. (BatchID 키는 B0, B1 등 원문에서 주어진 식별자를 그대로 사용하세요)
+{{
+  "B0": "번역문 0",
+  "B1": "번역문 1"
+}}
 """
     return instructions + "\n\n" + "\n".join(dialogue_blocks), id_map
 
@@ -300,7 +304,7 @@ def main():
             r_config["model_name"] = review_cfg["model"]
             review_backend = get_llm_backend(r_config, "step2_prompt")
             
-            backend = TranslationOrchestrator(gen_backends, review_backend, glossary_text=glossary_text) 
+            backend = TranslationOrchestrator(gen_backends, review_backend, glossary_text=glossary_text, work_dir=out_path.parent) 
         else:
             backend = get_llm_backend(config, "step2_prompt")
     except Exception as e:
@@ -315,8 +319,14 @@ def main():
     in_path = Path(in_path)
     out_path = Path(out_path)
     mod_stem = in_path.stem.replace("_dump", "")
+    progress_path = out_path.with_suffix(".progress.json")
+    
+    target_in = str(in_path)
+    if progress_path.exists():
+        log.info(f"임시 작업 파일 발견! 이어하기를 시도합니다: {progress_path.name}")
+        target_in = str(progress_path)
 
-    with open(in_path, "r", encoding="utf-8") as f:
+    with open(target_in, "r", encoding="utf-8") as f:
         scenes_data = json.load(f)
 
     if isinstance(scenes_data, list):
@@ -375,14 +385,18 @@ def main():
                 for dial in d.get("Dialogues", []):
                     txt = dial.get("Text")
                     if txt:
-                        if is_only_tags_and_punct(txt):
+                        if dial.get("Translate"):
+                            pass
+                        elif is_only_tags_and_punct(txt):
                             dial["Translate"] = txt
                         else:
                             dial_flat_list.append(dial)
                     for choice in dial.get("PlayerChoices", []):
                         ctxt = choice.get("Text")
                         if ctxt:
-                            if is_only_tags_and_punct(ctxt):
+                            if choice.get("Translate"):
+                                pass
+                            elif is_only_tags_and_punct(ctxt):
                                 choice["Translate"] = ctxt
                             else:
                                 dial_flat_list.append(choice)
@@ -392,14 +406,18 @@ def main():
             for d in dial.get("Dialogues", []):
                 txt = d.get("Text")
                 if txt:
-                    if is_only_tags_and_punct(txt):
+                    if d.get("Translate"):
+                        pass
+                    elif is_only_tags_and_punct(txt):
                         d["Translate"] = txt
                     else:
                         dial_flat_list.append(d)
                 for choice in d.get("PlayerChoices", []):
                     ctxt = choice.get("Text")
                     if ctxt:
-                        if is_only_tags_and_punct(ctxt):
+                        if choice.get("Translate"):
+                            pass
+                        elif is_only_tags_and_punct(ctxt):
                             choice["Translate"] = ctxt
                         else:
                             dial_flat_list.append(choice)
@@ -418,12 +436,26 @@ def main():
             # without letting prompts grow indefinitely.
             recent_context = chunk[-5:]
 
-            # 중간 저장 (실시간 반영)
-            with open(out_path, "w", encoding="utf-8") as f:
+            # 중간 저장 (실시간 반영은 임시 파일에)
+            with open(progress_path, "w", encoding="utf-8") as f:
                 json.dump(scenes_data, f, ensure_ascii=False, indent=2)
 
-    log.info("모든 작업이 완료되었습니다.")
-    
+    if b_stop_requested:
+        log.info(f"⚠️ 중지됨. 진행 상황 보존: {progress_path}")
+        # 중지되었을 때는 out_path를 쓰지 않고 progress_path만 남깁니다.
+    else:
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(scenes_data, f, ensure_ascii=False, indent=2)
+        if progress_path.exists():
+            progress_path.unlink()
+        
+        log.info("모든 작업이 완료되었습니다.")
+        
+        # 성공적으로 완료된 경우 오케스트레이터의 임시 캐시 삭제
+        from orchestrator import TranslationOrchestrator
+        if isinstance(backend, TranslationOrchestrator):
+            backend.cleanup()
+
     # 1min.ai 누적 크레딧 출력
     from llm_backend import Min1AIBackend
     if Min1AIBackend.total_used_credit > 0:

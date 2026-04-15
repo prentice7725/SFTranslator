@@ -206,7 +206,7 @@ class AutoPipeline:
         # reason about the exact last known state without inspecting logs.
         self.manifest.update_step(step_name, status="running", command=[str(part) for part in command])
         print(f"[RUN] {step_name}: {' '.join(str(part) for part in command)}")
-        return_code = run_subprocess(command, cwd=self.paths.work_dir)
+        return_code = run_subprocess(command)
         if return_code == 0:
             self.manifest.update_step(step_name, status="done")
         else:
@@ -292,7 +292,7 @@ class AutoPipeline:
                 )
                 self.manifest.update_step(step_name, status="running", command=[str(part) for part in command])
                 print(f"[RUN] {step_name}: {' '.join(str(part) for part in command)}")
-                return_code = run_subprocess(command, cwd=self.paths.work_dir)
+                return_code = run_subprocess(command)
                 if return_code == 0:
                     self.manifest.update_step(step_name, status="done")
                 else:

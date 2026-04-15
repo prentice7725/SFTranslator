@@ -664,6 +664,11 @@ def main():
         if progress_path.exists():
             progress_path.unlink()
 
+    # 성공적으로 완료된 경우 오케스트레이터의 임시 캐시 삭제
+    from orchestrator import TranslationOrchestrator
+    if isinstance(backend, TranslationOrchestrator):
+        backend.cleanup()
+
     # 1min.ai 누적 크레딧 출력
     from llm_backend import Min1AIBackend
     if Min1AIBackend.total_used_credit > 0:

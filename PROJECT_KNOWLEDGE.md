@@ -607,6 +607,10 @@ Step 6은 본선 자동 번역 메인 플로우라기보다 후처리 성격이 
 - `step0` ~ `step6 --help` 확인
 - 공통 커맨드 빌더 출력 확인
 
+- **GUI 안정성 강화**: `WorkerThread` 중지 시 `taskkill /F /T /PID`를 사용하여 무한 로딩/배경 실행 중인 파이썬 자식 프로세스 트리를 강제 종료 (API 크레딧 누수 방지).
+- **진행 상황 캐시(Progress) 보호 강화**: Step 2(`mod.progress.json`), Step 4(`mod.progress.xml`)에서 청크(Chunk) 단위 중간 자동 기장을 통해 중단 시점부터 이어하기 지원(Resume).
+- **오케스트레이터 구조 강화**: `work_dir` 격리로 여러 모드의 병렬 작업 간 로그(`debug_logs/orchestrator/`), 캐시(`translation_cache.json`) 충돌 방지 및 정상 종료 시 자동 클린업(Cleanup) 적용.
+
 아직 남은 것:
 
 - 실제 샘플 ESM/ESP 기준 end-to-end 실행 검증

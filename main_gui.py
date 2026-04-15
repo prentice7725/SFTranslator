@@ -118,8 +118,12 @@ class WorkerThread(QThread):
     def stop(self):
         self._is_stopped = True
         if self.process:
-            self.process.terminate()
-            self.log_signal.emit(f"[{self.step}] 작업 중지 요청됨...")
+            try:
+                import subprocess
+                subprocess.run(['taskkill', '/F', '/T', '/PID', str(self.process.pid)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as e:
+                self.process.kill()
+            self.log_signal.emit(f"[{self.step}] 작업 중지 요청됨 (프로세스 강제 종료)...")
 
     def run(self):
         self.log_signal.emit(f"[{self.step}] 작업을 시작합니다...")
@@ -159,7 +163,10 @@ class WorkerThread(QThread):
             self.process.stdout.close()
             
             if self._is_stopped:
-                self.process.terminate()
+                try:
+                    subprocess.run(['taskkill', '/F', '/T', '/PID', str(self.process.pid)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except:
+                    self.process.kill()
                 self.process.wait()
                 self.log_signal.emit(f"[{self.step}] 작업이 중지되었습니다.")
                 self.finished_signal.emit(False, "사용자에 의해 강제 종료됨.", self.step)
@@ -316,14 +323,7 @@ class MainApp(QMainWindow):
                 return
 
         # 1. ESM 파일 선택 (이미 LineEdit에 있으면 사용, 아니면 다시 묻지 않음)
-        # 2. Step 1 실행 (배경 작업으로 실행)
-        self.run_background_task("Step1", {
-            "input": self.auto_input_path.text(),
-            "config": "config.json"
-        }, self.auto_stop_btn)
-        
-        # Step1 완료 시 branch_detect 및 다음 단계는 WorkerThread의 finished_signal에서 처리하거나 
-        # autopipeline.py 내부적으로 처리하도록 유도해야 함.
+        # 2. auto_pipeline.py를 백그라운드 프로세스로 실행 (내부에서 순차적으로 Step 처리)
         # 여기서는 spec에 따라 autopipeline.py를 전체적으로 구동하는 것으로 설계됨.
         
         self.run_background_task("AutoPipeline", {

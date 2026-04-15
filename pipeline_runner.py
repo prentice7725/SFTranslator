@@ -121,17 +121,23 @@ def _stringify_command(parts: list[Any]) -> list[str]:
 
 
 def build_step_command(step_name: str, config: dict | None = None, **kwargs: Any) -> list[str]:
+    if isinstance(config, str):
+        kwargs["config_path"] = config
+        kwargs["config"] = config
+        config = None
+
     normalized = normalize_step_name(step_name)
     parts = []
     
     # Base command assembly
 
     # This is the single CLI contract boundary for GUI and auto pipeline.
-    # Legacy argument names are accepted here, then rewritten to the standard form.
+    input_esp = kwargs.get("input_esp") or kwargs.get("input")
+    paths = build_job_paths(input_esp) if input_esp else None
+
     if normalized == "auto_pipeline":
-        input_esp = kwargs.get("input_esp") or kwargs.get("input")
-        config = kwargs.get("config", "config.json")
-        parts: list[Any] = ["auto_pipeline.py", "--input-esp", input_esp, "--config", config]
+        config_path = kwargs.get("config") or kwargs.get("config_path") or "config.json"
+        parts: list[Any] = ["auto_pipeline.py", "--input-esp", input_esp, "--config", config_path]
         if kwargs.get("resume"):
             parts.append("--resume")
         if kwargs.get("include_step6"):
@@ -143,8 +149,7 @@ def build_step_command(step_name: str, config: dict | None = None, **kwargs: Any
         return _stringify_command(parts)
 
     if normalized == "step0":
-        input_esp = kwargs.get("input_esp") or kwargs.get("input")
-        output_xml = kwargs.get("output_xml") or kwargs.get("output")
+        output_xml = kwargs.get("output_xml") or kwargs.get("output") or (str(paths.step0_xml) if paths else None)
         parts = ["step0_extract_xml.py", "--input-esp", input_esp, "--output-xml", output_xml]
         if kwargs.get("strings_dir"):
             parts.extend(["--strings-dir", kwargs["strings_dir"]])
@@ -155,9 +160,8 @@ def build_step_command(step_name: str, config: dict | None = None, **kwargs: Any
         return _stringify_command(parts)
 
     if normalized == "step1":
-        input_esp = kwargs.get("input_esp") or kwargs.get("input")
-        output_json = kwargs.get("output_json") or kwargs.get("output")
-        output_priority = kwargs.get("output_priority")
+        output_json = kwargs.get("output_json") or kwargs.get("output") or (str(paths.step1_dump) if paths else None)
+        output_priority = kwargs.get("output_priority") or (str(paths.step1_priority) if paths else None)
         parts = ["step1_extract_scene.py", "--input-esp", input_esp, "--output-json", output_json]
         if output_priority:
             parts.extend(["--output-priority", output_priority])
