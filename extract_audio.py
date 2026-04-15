@@ -263,6 +263,7 @@ def run_extraction(priority_list_path, data_dir, output_dir):
 
 if __name__ == "__main__":
     import argparse
+    from pipeline_runner import print_ok
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--priority-list", default="priority_list.json")
     parser.add_argument("-d", "--data-dir", required=True, help="Starfield Data directory")
@@ -270,3 +271,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     run_extraction(args.priority_list, args.data_dir, args.output_dir)
+    print_ok(args.output_dir)

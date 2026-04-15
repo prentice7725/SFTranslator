@@ -9,6 +9,7 @@ import sys
 import os
 import json
 from pathlib import Path
+from pipeline_runner import build_job_paths, build_step_command
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QLabel, QLineEdit, QPushButton, QComboBox, QTextEdit,
@@ -16,6 +17,9 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QSplitter
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtWidgets import (
+    QDialog, QRadioButton, QButtonGroup
+)
 
 CONFIG_FILE = "config.json"
 
@@ -125,79 +129,9 @@ class WorkerThread(QThread):
             import subprocess
             import sys
             
-            script_map = {
-                "Step1": "step1_extract_scene.py",
-                "Step2": "step2_translate_scene.py",
-                "Step3": "step3_build_xml.py",
-                "Step4": "step4_translate_xml.py",
-                "Step5": "step5_review_xml.py",
-                "Step6": "step6_mod_update.py",
-                "AudioExtract": "extract_audio.py",
-                "AudioProfile": "audition_profiler.py",
-                "AutoPipeline": "auto_pipeline.py"
-            }
-            script_file = script_map.get(self.step)
-            if not script_file:
-                self.finished_signal.emit(False, "알 수 없는 배치 작업입니다.", self.step)
-                return
-
-            cmd = [sys.executable, script_file]
-            
-            if self.step == "Step1":
-                cmd.extend(["-i", self.kwargs["input"], "-o", self.kwargs["output"]])
-                if self.kwargs.get("strings"):
-                    cmd.extend(["-s", self.kwargs["strings"]])
-                if self.kwargs.get("use_ja_ref"):
-                    cmd.append("--use-ja-ref")
-            elif self.step == "Step2":
-                cmd.extend(["-i", self.kwargs["input"], "-o", self.kwargs["output"]])
-                if self.kwargs.get("profile_only"):
-                    cmd.append("--profile-only")
-                if self.kwargs.get("use_ja_ref"):
-                    cmd.append("--use_ja_ref")
-            elif self.step == "AutoPipeline":
-                cmd.extend(["-i", self.kwargs["input"]])
-                if self.kwargs.get("config"):
-                    cmd.extend(["-c", self.kwargs["config"]])
-            elif self.step == "Step3":
-                if self.kwargs.get("merge_xml"):
-                    # XML 머지 모드: --merge-xml <기존xml> -t <json> [-o <출력xml>]
-                    cmd.extend(["-x", self.kwargs["merge_xml"]])
-                    cmd.extend(["-t", self.kwargs["trans"]])
-                    if self.kwargs.get("out"):
-                        cmd.extend(["-o", self.kwargs["out"]])
-                else:
-                    # ESM 모드 (기존 동작)
-                    cmd.extend(["-i", self.kwargs["esm"]])
-                    if self.kwargs.get("trans"):
-                        cmd.extend(["-t", self.kwargs["trans"]])
-                    if self.kwargs.get("out"):
-                        cmd.extend(["-o", self.kwargs["out"]])
-            elif self.step == "Step4":
-                cmd.extend(["-i", self.kwargs["input"], "-o", self.kwargs["output"]])
-                if self.kwargs.get("use_ja_ref"):
-                    cmd.append("--use-ja-ref")
-            elif self.step == "Step5":
-                cmd.extend(["-i", self.kwargs["input"], "-o", self.kwargs["output"]])
-                if self.kwargs.get("scan_only"):
-                    cmd.append("--scan-only")
-                elif self.kwargs.get("indices"):
-                    cmd.extend(["--translate-indices", self.kwargs["indices"]])
-            elif self.step == "Step6":
-                cmd.extend(["-i", self.kwargs["input"], "-m", self.kwargs["mode"], "-o", self.kwargs["output"]])
-                if self.kwargs.get("profile"):
-                    cmd.extend(["-p", self.kwargs["profile"]])
-                if self.kwargs.get("reference"):
-                    cmd.extend(["-r", self.kwargs["reference"]])
-            elif self.step == "AudioExtract":
-                cmd.extend(["-p", self.kwargs["priority_list"]])
-                cmd.extend(["-d", self.kwargs["data_dir"]])
-                cmd.extend(["-o", self.kwargs["output_dir"]])
-            elif self.step == "AudioProfile":
-                cmd.extend(["-c", self.kwargs["config"]])
-                cmd.extend(["-p", self.kwargs["priority_list"]])
-                cmd.extend(["-a", self.kwargs["audition_dir"]])
-                cmd.extend(["-o", self.kwargs["output"]])
+            # GUI also goes through the shared command builder so step CLI
+            # changes only need to be updated in one place.
+            cmd = [sys.executable] + build_step_command(self.step, **self.kwargs)
             
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
@@ -218,6 +152,8 @@ class WorkerThread(QThread):
                 if self._is_stopped:
                     break
                 if line:
+                    # Stream child stdout directly into the GUI log instead of
+                    # waiting for process completion.
                     self.log_signal.emit(line.strip("\n"))
             
             self.process.stdout.close()
@@ -361,6 +297,35 @@ class MainApp(QMainWindow):
         self.config_mgr.config["orchestrator"]["enabled"] = (mode == "high_quality")
         self.config_mgr.save()
 
+        # 0. 설정 필수 필드 확인
+        config = self.config_mgr.config
+        required = ["provider", "models"]
+        is_valid = all(k in config for k in required)
+        if is_valid:
+            models = config.get("models", {})
+            is_valid = all(k in models for k in ["audio_profile", "translation", "review"])
+            
+        if not is_valid:
+            dlg = CommonConfigDialog(self, config)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                new_cfg = dlg.get_config()
+                config.update(new_cfg)
+                self.config_mgr.save()
+                self.append_log("공통 AI 설정이 저장되었습니다.")
+            else:
+                return
+
+        # 1. ESM 파일 선택 (이미 LineEdit에 있으면 사용, 아니면 다시 묻지 않음)
+        # 2. Step 1 실행 (배경 작업으로 실행)
+        self.run_background_task("Step1", {
+            "input": self.auto_input_path.text(),
+            "config": "config.json"
+        }, self.auto_stop_btn)
+        
+        # Step1 완료 시 branch_detect 및 다음 단계는 WorkerThread의 finished_signal에서 처리하거나 
+        # autopipeline.py 내부적으로 처리하도록 유도해야 함.
+        # 여기서는 spec에 따라 autopipeline.py를 전체적으로 구동하는 것으로 설계됨.
+        
         self.run_background_task("AutoPipeline", {
             "input": self.auto_input_path.text(),
             "config": "config.json"
@@ -759,10 +724,8 @@ class MainApp(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Bethesda Plugin 파일 선택", "", "Bethesda Plugin Files (*.esm *.esp);;All Files (*)")
         if path:
             self.step1_input.setText(path)
-            # 입력 폴더 기준으로 출력 경로 세팅
-            dir_name = os.path.dirname(path)
-            base_name = os.path.splitext(os.path.basename(path))[0]
-            self.step1_output.setText(os.path.join(dir_name, f"{base_name}_dump.json"))
+            job_paths = build_job_paths(path)
+            self.step1_output.setText(str(job_paths.step1_dump))
 
     def run_step1(self):
         self.run_background_task("Step1", {
@@ -842,9 +805,13 @@ class MainApp(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "JSON 파일 선택", "", "JSON Files (*.json);;All Files (*)")
         if path:
             self.step2_input.setText(path)
-            dir_name = os.path.dirname(path)
-            base_name = os.path.basename(path).replace("_dump.json", "").replace(".json", "")
-            self.step2_output.setText(os.path.join(dir_name, f"{base_name}_translated_dict.json"))
+            input_path = Path(path)
+            stem = input_path.name
+            if ".step1.dump.json" in stem:
+                mod_stem = stem.replace(".step1.dump.json", "")
+            else:
+                mod_stem = stem.replace("_dump.json", "").replace(".json", "")
+            self.step2_output.setText(str(input_path.with_name(f"{mod_stem}.step2.translated.json")))
             self.load_step2_profile_file()
             
     def run_step2_profile(self):
@@ -866,8 +833,9 @@ class MainApp(QMainWindow):
         # 후보 파일 목록 (오디오 기반 tone_profiles.json 우선 확인)
         dir_name = os.path.dirname(self.step2_input.text())
         candidates = [
-            os.path.join(dir_name, "tone_profiles.json"), # 오디오 분석 결과물
-            self.step2_output.text().replace(".json", "_tone_profile.json"),
+            self.step2_output.text().replace(".json", "_profile.json"),
+            os.path.join(dir_name, Path(self.step2_output.text()).name.replace(".step2.translated.json", ".step2.profile.json")),
+            os.path.join(dir_name, "tone_profiles.json"),
             os.path.join(dir_name, "tone_profile.json")
         ]
         
@@ -991,9 +959,8 @@ class MainApp(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "ESM/ESP 파일 선택", "", "Bethesda Plugin Files (*.esm *.esp);;All Files (*)")
         if path:
             self.step3_esm_input.setText(path)
-            dir_name = os.path.dirname(path)
-            base_name = os.path.splitext(os.path.basename(path))[0]
-            self.step3_output.setText(os.path.join(dir_name, f"{base_name}_out.xml"))
+            job_paths = build_job_paths(path)
+            self.step3_output.setText(str(job_paths.step3_merged))
 
     def browse_step3_merge_xml(self):
         path, _ = QFileDialog.getOpenFileName(self, "완성된 XML 파일 선택", "", "XML Files (*.xml);;All Files (*)")
@@ -1084,9 +1051,9 @@ class MainApp(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "XML 파일 선택", "", "XML Files (*.xml);;All Files (*)")
         if path:
             self.step4_input.setText(path)
-            dir_name = os.path.dirname(path)
-            base_name = os.path.splitext(os.path.basename(path))[0]
-            self.step4_output.setText(os.path.join(dir_name, f"{base_name}_translated.xml"))
+            input_path = Path(path)
+            stem = input_path.name.replace(".step3.merged.xml", "").replace(".xml", "")
+            self.step4_output.setText(str(input_path.with_name(f"{stem}.step4.translated.xml")))
             
     def save_step4_prompt(self):
         self.config_mgr.config["step4_prompt"] = self.step4_prompt_edit.toPlainText()
@@ -1165,10 +1132,13 @@ class MainApp(QMainWindow):
             QMessageBox.warning(self, "경고", "먼저 입력 XML 파일을 지정하세요.")
             return
         self.step5_table.setRowCount(0)
+        input_path = Path(self.step5_input.text())
+        stem = input_path.name.replace(".step4.translated.xml", "").replace(".xml", "")
         self.run_background_task("Step5", {
             "input": self.step5_input.text(),
             "output": self.step5_output.text() or self.step5_input.text(),
-            "scan_only": True
+            "scan_only": True,
+            "scan_output": str(input_path.with_name(f"{stem}.step5.scan.json"))
         }, self.step5_stop_btn)
 
     def run_step5_translate(self):
@@ -1194,11 +1164,42 @@ class MainApp(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "XML 파일 선택", "", "XML Files (*.xml);;All Files (*)")
         if path:
             self.step5_input.setText(path)
-            dir_name = os.path.dirname(path)
-            base_name = os.path.splitext(os.path.basename(path))[0]
-            if base_name.endswith("_translated"):
-                base_name = base_name.replace("_translated", "")
-            self.step5_output.setText(os.path.join(dir_name, f"{base_name}_final.xml"))
+            input_path = Path(path)
+            stem = input_path.name.replace(".step4.translated.xml", "").replace(".xml", "")
+            self.step5_output.setText(str(input_path.with_name(f"{stem}.step5.reviewed.xml")))
+
+    def load_step5_scan_results(self, scan_path):
+        if not scan_path or not os.path.exists(scan_path):
+            return
+        from PyQt6.QtWidgets import QCheckBox, QWidget, QHBoxLayout, QTableWidgetItem
+
+        with open(scan_path, "r", encoding="utf-8") as f:
+            rows = json.load(f)
+
+        # Rehydrate the table from the persisted scan JSON so rescans and
+        # manual follow-up translation share the same data source.
+        self.step5_table.setRowCount(0)
+        for row_idx, item in enumerate(rows):
+            self.step5_table.insertRow(row_idx)
+            chk = QCheckBox()
+            holder = QWidget()
+            holder_layout = QHBoxLayout(holder)
+            holder_layout.setContentsMargins(0, 0, 0, 0)
+            holder_layout.addWidget(chk)
+            holder_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.step5_table.setCellWidget(row_idx, 0, holder)
+
+            values = [
+                str(item.get("index", "")),
+                item.get("status", ""),
+                item.get("edid", ""),
+                item.get("rec", ""),
+                item.get("error", ""),
+                item.get("source", ""),
+                item.get("dest", ""),
+            ]
+            for col_idx, value in enumerate(values, start=1):
+                self.step5_table.setItem(row_idx, col_idx, QTableWidgetItem(value))
 
     def save_step5_prompt(self):
         self.config_mgr.config["step5_prompt"] = self.step5_prompt_edit.toPlainText()
@@ -1314,6 +1315,8 @@ class MainApp(QMainWindow):
             self.append_log(f"성공: {msg}")
             if step_name == "Step2" and getattr(self, "current_kwargs", {}).get("profile_only"):
                 self.load_step2_profile_file()
+            if step_name == "Step5" and getattr(self, "current_kwargs", {}).get("scan_only"):
+                self.load_step5_scan_results(getattr(self, "current_kwargs", {}).get("scan_output"))
         else:
             self.append_log(f"실패/에러: {msg}")
 
@@ -1536,6 +1539,108 @@ class MainApp(QMainWindow):
             "audition_dir": self.audio_temp_dir.text(),
             "output": self.audio_profile_out.text()
         }, self.audio_stop_btn)
+
+class CommonConfigDialog(QDialog):
+    def __init__(self, parent=None, config=None):
+        super().__init__(parent)
+        self.config = config or {}
+        self.setWindowTitle("공통 AI 설정")
+        self.setMinimumWidth(450)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        
+        group_provider = QGroupBox("실행 방식 (Provider)")
+        provider_layout = QHBoxLayout(group_provider)
+        self.provider_group = QButtonGroup(self)
+        self.rb_vertex = QRadioButton("VertexAI")
+        self.rb_1minai = QRadioButton("1min.ai")
+        self.provider_group.addButton(self.rb_vertex)
+        self.provider_group.addButton(self.rb_1minai)
+        provider_layout.addWidget(self.rb_vertex)
+        provider_layout.addWidget(self.rb_1minai)
+        
+        provider = self.config.get("provider") or self.config.get("api_provider", "1minai")
+        if provider == "vertexai": self.rb_vertex.setChecked(True)
+        else: self.rb_1minai.setChecked(True)
+        
+        layout.addWidget(group_provider)
+        
+        form = QFormLayout()
+        self.cb_audio = QComboBox()
+        self.cb_trans = QComboBox()
+        self.cb_review = QComboBox()
+        
+        self.update_model_lists()
+        
+        form.addRow("오디오 샘플 분석 AI:", self.cb_audio)
+        form.addRow("번역 AI:", self.cb_trans)
+        form.addRow("감수 AI:", self.cb_review)
+        
+        layout.addLayout(form)
+        
+        # 기본값 설정 루틴
+        models = self.config.get("models", {})
+        def safe_set_text(cb, txt):
+            idx = cb.findText(txt)
+            if idx >= 0: cb.setCurrentIndex(idx)
+            else: cb.setCurrentText(txt)
+
+        safe_set_text(self.cb_audio, models.get("audio_profile", "gemini-2.5-pro"))
+        safe_set_text(self.cb_trans, models.get("translation", "gemini-2.5-flash"))
+        safe_set_text(self.cb_review, models.get("review", "gemini-2.5-pro"))
+        
+        self.rb_vertex.toggled.connect(self.update_model_lists)
+        self.rb_1minai.toggled.connect(self.update_model_lists)
+        
+        btn_layout = QHBoxLayout()
+        btn_save = QPushButton("저장")
+        btn_cancel = QPushButton("취소")
+        btn_save.clicked.connect(self.accept)
+        btn_cancel.clicked.connect(self.reject)
+        btn_layout.addWidget(btn_save)
+        btn_layout.addWidget(btn_cancel)
+        layout.addLayout(btn_layout)
+
+    def update_model_lists(self):
+        # 현재 선택된 텍스트 기억
+        curr_a = self.cb_audio.currentText()
+        curr_t = self.cb_trans.currentText()
+        curr_r = self.cb_review.currentText()
+
+        self.cb_audio.clear()
+        self.cb_trans.clear()
+        self.cb_review.clear()
+        
+        if self.rb_vertex.isChecked():
+            list_models = ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro-002", "gemini-1.5-flash-002"]
+        else:
+            # 1min.ai
+            list_models = ["gpt-4o-mini", "claude-3-5-sonnet", "gemini-1.5-pro", "gpt-4o", "gemini-2.0-flash"]
+            
+        self.cb_audio.addItems(list_models)
+        self.cb_trans.addItems(list_models)
+        self.cb_review.addItems(list_models)
+
+        # 기억했던 텍스트 복구 시도
+        for cb, txt in [(self.cb_audio, curr_a), (self.cb_trans, curr_t), (self.cb_review, curr_r)]:
+            idx = cb.findText(txt)
+            if idx >= 0: cb.setCurrentIndex(idx)
+
+    def get_config(self):
+        provider = "vertexai" if self.rb_vertex.isChecked() else "1minai"
+        return {
+            "provider": provider,
+            "models": {
+                "audio_profile": self.cb_audio.currentText(),
+                "translation": self.cb_trans.currentText(),
+                "review": self.cb_review.currentText()
+            },
+            "pipeline": {
+                "auto_apply_cli": True
+            }
+        }
 
 
 if __name__ == "__main__":

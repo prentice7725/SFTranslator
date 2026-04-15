@@ -3,9 +3,24 @@ import json
 import argparse
 import hashlib
 import re
+import sys
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 from step0_extract_xml import EspParser, StringEntry, StringsLoader, write_xml, sanitize_xml_chars
+from pipeline_runner import (
+    EXIT_ARGUMENT_ERROR,
+    EXIT_INPUT_MISSING,
+    EXIT_INTERNAL_ERROR,
+    EXIT_SUCCESS,
+    ensure_parent,
+    print_ok,
+    require_file,
+)
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 def generate_text_hash(text: str) -> str:
     """원시 텍스트 식별을 위한 해시 키 생성. Step 2와 동일 로직이어야 함."""
@@ -177,6 +192,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Step 3: ESM에서 XML 생성 또는 기존 XML에 JSON 번역을 머지합니다."
     )
+    parser.add_argument("--input-esp", dest="input_esp", default=None)
+    parser.add_argument("--base-xml", dest="base_xml", default=None)
+    parser.add_argument("--input-json", dest="input_json", default=None)
+    parser.add_argument("--output-xml", dest="output_xml", default=None)
     parser.add_argument("-i", "--input", default=None,
                         help="[ESM 모드] 원본 .esm 파일 경로")
     parser.add_argument("-x", "--merge-xml", default=None,
@@ -189,26 +208,53 @@ def main():
                         help="[ESM 모드] .strings 파일 디렉토리 (optional)")
     parser.add_argument("--lang", default="en",
                         help="[ESM 모드] .strings 파일 언어 코드 (default: en)")
+    parser.add_argument("--direct-build", action="store_true",
+                        help="Step 2 번역 과정 없이 ESM/XML에서 직접 XML 생성")
     args = parser.parse_args()
+
+    args.input = args.input_esp or args.input
+    args.merge_xml = args.base_xml or args.merge_xml
+    args.translation = args.input_json or args.translation
+    args.output = args.output_xml or args.output
+
+    # Step 3 is the bridge between scene translation and XML translation, so it
+    # still carries both the standardized path and the older merge-only workflow.
 
     # ----------------------------------------------------------------
     # [XML 머지 모드] --merge-xml 지정 시: 기존 XML + JSON → XML 업데이트
     # ----------------------------------------------------------------
     if args.merge_xml:
-        xml_path = os.path.abspath(args.merge_xml)
-
-        if not args.translation:
-            print("ERROR: --merge-xml 모드에서는 -t/--translation JSON 파일이 필요합니다.")
-            return
-
-        trans_path = os.path.abspath(args.translation)
+        try:
+            xml_path = str(require_file(args.merge_xml, "base XML"))
+        except FileNotFoundError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return EXIT_INPUT_MISSING
 
         # 출력 경로: 지정 없으면 원본 XML 덮어쓰기
         if args.output:
-            output_xml = os.path.abspath(args.output)
+            output_xml = str(ensure_parent(args.output))
         else:
             base, ext = os.path.splitext(xml_path)
             output_xml = xml_path  # 덮어쓰기 (백업 후)
+
+        if args.direct_build:
+            import shutil
+            shutil.copyfile(xml_path, output_xml)
+            print(f"[XML 머지 모드 - Direct Build]")
+            print(f"  기존 XML 그대로 복사: {xml_path} -> {output_xml}")
+            print_ok(output_xml)
+            return EXIT_SUCCESS
+
+        if not args.translation:
+            if not args.direct_build:
+                print("ERROR: --base-xml requires --input-json or --direct-build.", file=sys.stderr)
+                return EXIT_ARGUMENT_ERROR
+
+        try:
+            trans_path = str(require_file(args.translation, "translation JSON"))
+        except FileNotFoundError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return EXIT_INPUT_MISSING
 
         print(f"[XML 머지 모드]")
         print(f"  기존 XML  : {xml_path}")
@@ -221,19 +267,24 @@ def main():
 
         merge_json_into_xml(xml_path, translated_map, output_xml)
         print("Done!")
-        return
+        print_ok(output_xml)
+        return EXIT_SUCCESS
 
     # ----------------------------------------------------------------
     # [ESM 모드] 기존 동작: ESM → XML 생성 (+ JSON 머지 선택사항)
     # ----------------------------------------------------------------
     if not args.input:
-        print("ERROR: -i/--input (ESM 파일) 또는 -x/--merge-xml (기존 XML) 중 하나를 지정하세요.")
-        return
+        print("ERROR: --input-esp or --base-xml is required.", file=sys.stderr)
+        return EXIT_ARGUMENT_ERROR
 
-    input_path = os.path.abspath(args.input)
-    trans_path = os.path.abspath(args.translation) if args.translation else ""
+    try:
+        input_path = str(require_file(args.input, "input ESM"))
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return EXIT_INPUT_MISSING
+    trans_path = str(require_file(args.translation, "translation JSON")) if args.translation else ""
     mod_stem = os.path.splitext(os.path.basename(input_path))[0]
-    output_xml = os.path.abspath(args.output) if args.output else os.path.join(
+    output_xml = str(ensure_parent(args.output)) if args.output else os.path.join(
         os.path.dirname(input_path), f"{mod_stem}_Translated.xml"
     )
 
@@ -261,6 +312,8 @@ def main():
     entries = esp.entries
     print(f"Extracted {len(entries)} translatable string entries from ESM.")
 
+    # Match translated entries in descending confidence order so broad text
+    # fallbacks only run when stable identifiers are unavailable.
     # 2. 매핑 로직 (우선순위: StringID hex > 텍스트 해시 > 원문 직접 비교)
     match_count = 0
     for entry in entries:
@@ -287,7 +340,13 @@ def main():
     print(f"Exporting final XML to {output_xml}")
     write_xml(entries, output_xml, os.path.basename(input_path))
     print("Done!")
+    print_ok(output_xml)
+    return EXIT_SUCCESS
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(EXIT_INTERNAL_ERROR)

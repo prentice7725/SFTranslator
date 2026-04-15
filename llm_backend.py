@@ -15,6 +15,19 @@ from typing import Dict, Any, List, Optional, Union
 
 log = logging.getLogger("LLMBackend")
 
+ROLE_KEY_MAP = {
+    "audio_profile": "models.audio_profile",
+    "translation":   "models.translation",
+    "review":        "models.review",
+}
+
+def get_model_for_role(config: dict, role: str) -> str:
+    """role = 'audio_profile' | 'translation' | 'review'"""
+    if "models" in config and role in config["models"]:
+        return config["models"][role]
+    # 폴백: 기존 model_name 사용
+    return config.get("model_name", "gemini-2.5-flash")
+
 class CostTracker:
     """
     LLM API 호출 시 소모된 입력(Input) 및 출력(Output) 토큰 수를 누적하고,
@@ -588,14 +601,20 @@ def _deobfuscate(text: str) -> str:
     except:
         return text
 
-def get_llm_backend(config_dict, step_prompt_key, max_retries=3, retry_base_wait=60):
-    provider = config_dict.get("api_provider", "vertexai")
+def get_llm_backend(config_dict, step_prompt_key, role=None, max_retries=3, retry_base_wait=60):
+    # 신규 'provider' 필드 우선, 없으면 기존 'api_provider' 사용
+    provider = config_dict.get("provider") or config_dict.get("api_provider", "vertexai")
     
     # [보강] vertexai_gemini 등의 별칭도 vertexai 공식 명칭으로 매핑
-    if str(provider).lower() in ["vertexai_gemini", "vertex_ai", "google"]:
+    if str(provider).lower() in ["vertexai_gemini", "vertex_ai", "google", "vertexai"]:
         provider = "vertexai"
 
-    model_name = config_dict.get("model_name", "gemini-3-flash-preview")
+    # role이 주어지면 해당 역할에 맞는 모델 선택, 아니면 기본 model_name 사용
+    if role:
+        model_name = get_model_for_role(config_dict, role)
+    else:
+        model_name = config_dict.get("model_name", "gemini-2.5-flash")
+    
     system_instruction = config_dict.get(step_prompt_key, "")
     
     if provider == "vertexai":

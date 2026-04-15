@@ -1,10 +1,26 @@
 import argparse
 import json
 import os
+import sys
 import struct
 import zlib
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+from pipeline_runner import (
+    EXIT_ARGUMENT_ERROR,
+    EXIT_INPUT_MISSING,
+    EXIT_INTERNAL_ERROR,
+    EXIT_OUTPUT_FAILURE,
+    EXIT_SUCCESS,
+    ensure_parent,
+    print_ok,
+    require_file,
+)
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 HEADER_TES4 = b"TES4"
 HEADER_GRUP = b"GRUP"
@@ -1203,16 +1219,31 @@ class StarfieldSceneExtractor:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-i", "--input", required=True)
+    parser.add_argument("--input-esp", dest="input_esp", default=None)
+    parser.add_argument("-i", "--input", required=False)
     parser.add_argument("--strings-dir", default=None)
     parser.add_argument("--lang", default="en")
     parser.add_argument("--use-ja-ref", action="store_true", help="일본어 원문 참조 모드 활성 (공식 DLC/모드 등 일본어 존재 시)")
-    parser.add_argument("-o", "--output", default="dump.json")
+    parser.add_argument("--output-json", dest="output_json", default=None)
+    parser.add_argument("--output-priority", dest="output_priority", default=None)
+    parser.add_argument("-o", "--output", default=None)
     args = parser.parse_args()
 
-    input_path = os.path.abspath(args.input)
+    args.input = args.input_esp or args.input
+    if not args.input:
+        print("Error: input ESM/ESP is required.", file=sys.stderr)
+        return EXIT_ARGUMENT_ERROR
+
+    try:
+        input_path = str(require_file(args.input, "input"))
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return EXIT_INPUT_MISSING
+
     mod_stem = os.path.splitext(os.path.basename(input_path))[0]
-    out_file = os.path.abspath(args.output)
+    output_json = args.output_json or args.output or "dump.json"
+    out_file = str(ensure_parent(output_json))
+    priority_file = str(ensure_parent(args.output_priority)) if args.output_priority else os.path.join(os.path.dirname(out_file), "priority_list.json")
     strings_dir = args.strings_dir if args.strings_dir else os.path.dirname(input_path)
 
     langs = [args.lang]
@@ -1268,7 +1299,6 @@ def main():
         count = min(len(samples), 10)
         priority_list[spk] = random.sample(samples, count)
 
-    priority_file = os.path.join(os.path.dirname(out_file), "priority_list.json")
     with open(priority_file, "w", encoding="utf-8") as f:
         json.dump(priority_list, f, ensure_ascii=False, indent=2)
     print(f"  ✓ Priority list created ({len(priority_list)} speakers): {priority_file}")
@@ -1286,7 +1316,13 @@ def main():
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(batches, f, ensure_ascii=False, indent=2)
     print(f"✅ Extracted scene data saved: {out_file}")
+    print_ok(out_file)
+    return EXIT_SUCCESS
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(EXIT_INTERNAL_ERROR)

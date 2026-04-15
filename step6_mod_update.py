@@ -1,9 +1,24 @@
 import os
 import argparse
 import json
+import sys
 import xml.etree.ElementTree as ET
 from llm_backend import get_llm_backend
 from step1_extract_scene import StringsLoader
+from pipeline_runner import (
+    EXIT_ARGUMENT_ERROR,
+    EXIT_INPUT_MISSING,
+    EXIT_INTERNAL_ERROR,
+    EXIT_SUCCESS,
+    ensure_parent,
+    print_ok,
+    require_file,
+)
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 def load_config():
     if os.path.exists('config.json'):
@@ -147,16 +162,33 @@ def perform_update(texts, ref_path, config):
 
 def main():
     parser = argparse.ArgumentParser(description="Step 6: Mod & DLC Translator / Text Refiner")
-    parser.add_argument("-i", "--input", required=True, help="Input XML or Strings file")
+    parser.add_argument("--input-file", dest="input_file", default=None, help="Standardized Step 6 input path")
+    parser.add_argument("--output-xml", dest="output_xml", default=None, help="Standardized Step 6 output XML path")
+    parser.add_argument("--profile-json", dest="profile_json", default=None, help="Standardized profile JSON path")
+    parser.add_argument("-i", "--input", required=False, help="Input XML or Strings file")
     parser.add_argument("-m", "--mode", choices=["refine", "update"], required=True)
-    parser.add_argument("-o", "--output", required=True, help="Target output XML file")
+    parser.add_argument("-o", "--output", required=False, help="Target output XML file")
     parser.add_argument("-p", "--profile", help="(Refine Mode) JSON tone profile from Step 2")
     parser.add_argument("-r", "--reference", help="(Update Mode) Previous translated XML/Strings file")
     
     args = parser.parse_args()
+    args.input = args.input_file or args.input
+    args.output = args.output_xml or args.output
+    args.profile = args.profile_json or args.profile
+    if not args.input or not args.output:
+        print("Error: --input-file and --output-xml are required.", file=sys.stderr)
+        return EXIT_ARGUMENT_ERROR
+
+    try:
+        input_file = require_file(args.input, "input file")
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return EXIT_INPUT_MISSING
+
+    output_xml = ensure_parent(args.output)
     config = load_config()
     
-    texts = extract_texts_from_file(args.input)
+    texts = extract_texts_from_file(str(input_file))
     print(f"Extracted {len(texts)} translation entries.")
     
     if args.mode == "refine":
@@ -164,9 +196,9 @@ def main():
     elif args.mode == "update":
         perform_update(texts, args.reference, config)
         
-    print(f"Saving to {args.output}...")
-    if args.input.endswith('.xml'):
-        tree = ET.parse(args.input)
+    print(f"Saving to {output_xml}...")
+    if str(input_file).endswith('.xml'):
+        tree = ET.parse(str(input_file))
         root = tree.getroot()
         
         # 위에서 정의한 것과 동일한 방식으로 엔트리 탐색
@@ -191,7 +223,7 @@ def main():
                     dest = ET.SubElement(entry, 'Dest')
                 dest.text = texts[db_id]["dest"]
                 
-        tree.write(args.output, encoding="utf-8", xml_declaration=True)
+        tree.write(str(output_xml), encoding="utf-8", xml_declaration=True)
     else:
         # Save straight to an XML standard format anyway for compatibility
         root = ET.Element("SSTXMLRsrc")
@@ -202,9 +234,15 @@ def main():
             dst = ET.SubElement(content, "Dest")
             dst.text = data["dest"]
         tree = ET.ElementTree(root)
-        tree.write(args.output, encoding="utf-8", xml_declaration=True)
+        tree.write(str(output_xml), encoding="utf-8", xml_declaration=True)
         
     print("Step 6 process completed.")
+    print_ok(output_xml)
+    return EXIT_SUCCESS
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(EXIT_INTERNAL_ERROR)

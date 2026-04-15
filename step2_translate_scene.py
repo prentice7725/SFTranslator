@@ -5,9 +5,24 @@ import logging
 import os
 import argparse
 import signal
+import sys
 from pathlib import Path
 
 import json_repair
+from pipeline_runner import (
+    EXIT_ARGUMENT_ERROR,
+    EXIT_INPUT_MISSING,
+    EXIT_INTERNAL_ERROR,
+    EXIT_SUCCESS,
+    ensure_parent,
+    print_ok,
+    require_file,
+)
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # 로거 및 설정
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s | %(message)s")
@@ -37,9 +52,10 @@ except ImportError:
 # =============================================================================
 # 유틸리티
 # =============================================================================
-def load_config():
-    if CONFIG_FILE.exists():
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+def load_config(config_path: str | Path | None = None):
+    target = Path(config_path).expanduser().resolve() if config_path else CONFIG_FILE
+    if target.exists():
+        with open(target, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
@@ -225,15 +241,37 @@ def translate_scene_recursive(chunk_items, backend, mod_stem, context_lines, sce
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-i", "--input", required=True, help="Extract JSON path (Step 1 output)")
-    parser.add_argument("-o", "--output", required=True, help="Output translated JSON path")
+    parser.add_argument("--input-json", dest="input_json", default=None, help="Standardized Step 1 JSON input path")
+    parser.add_argument("--output-json", dest="output_json", default=None, help="Standardized translated JSON output path")
+    parser.add_argument("--profile-json", dest="profile_json", default=None, help="Standardized scene profile JSON output path")
+    parser.add_argument("--config", default=str(CONFIG_FILE), help="Config JSON path")
+    parser.add_argument("-i", "--input", required=False, help="Extract JSON path (Step 1 output)")
+    parser.add_argument("-o", "--output", required=False, help="Output translated JSON path")
     parser.add_argument("--use-ja-ref", action="store_true", help="Use Japanese references")
     parser.add_argument("--profile-only", action="store_true", help="Generate profile only")
-    parser.add_argument("--tone-profiles", default="tone_profiles.json", help="Path to tone_profiles.json")
+    parser.add_argument("--tone-profile", dest="tone_profile", default=None, help="Path to audio tone profile JSON")
+    parser.add_argument("--tone-profiles", default=None, help="Legacy alias for tone profile JSON path")
     args = parser.parse_args()
+    args.input = args.input_json or args.input
+    args.output = args.output_json or args.output
+    if not args.input or not args.output:
+        print("Error: --input-json and --output-json are required.", file=sys.stderr)
+        return EXIT_ARGUMENT_ERROR
 
-    config = load_config()
-    
+    try:
+        in_path = require_file(args.input, "input")
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return EXIT_INPUT_MISSING
+
+    out_path = ensure_parent(args.output)
+    profile_path = ensure_parent(args.profile_json or out_path.with_name(out_path.stem + "_profile.json"))
+    tone_profile_arg = args.tone_profile or args.tone_profiles
+
+    # The shared runner passes the config path explicitly so every entrypoint
+    # resolves prompts and backend settings the same way.
+    config = load_config(args.config)
+
     glossary_dict = load_glossary_db()
     glossary_text = "\n".join([f"- {k}: {v}" for k, v in glossary_dict.items()])
     
@@ -274,13 +312,9 @@ def main():
 
     rag = DBRAG()
 
-    in_path = Path(args.input)
-    out_path = Path(args.output)
+    in_path = Path(in_path)
+    out_path = Path(out_path)
     mod_stem = in_path.stem.replace("_dump", "")
-
-    if not in_path.exists():
-        log.error(f"입력 파일을 찾을 수 없습니다: {in_path}")
-        return
 
     with open(in_path, "r", encoding="utf-8") as f:
         scenes_data = json.load(f)
@@ -290,8 +324,8 @@ def main():
     else:
         quests = scenes_data.get("Quests", [])
     
-    # 프로파일 경로: 출력 파일명 기반
-    profile_path = out_path.with_name(out_path.stem + "_profile.json")
+    # Quest profiles are reused across reruns so profile-only and full runs
+    # can share the expensive analysis output.
     all_profiles = {}
     if profile_path.exists():
         try:
@@ -300,9 +334,16 @@ def main():
         except:
             all_profiles = {}
 
-    # 오디션 분석 결과(tone_profiles) 로드
+    # Tone profiles come from the optional audio side pipeline and are safe to
+    # omit; translation falls back to text-only context when absent.
     tone_profiles = {}
-    tp_path = Path(args.tone_profiles)
+    if not tone_profile_arg:
+        candidate_paths = [
+            in_path.parent / f"{mod_stem}.audio.tone_profiles.json",
+            in_path.parent / "tone_profiles.json",
+        ]
+        tone_profile_arg = next((str(candidate) for candidate in candidate_paths if candidate.exists()), None)
+    tp_path = Path(tone_profile_arg) if tone_profile_arg else Path("")
     if tp_path.exists():
         log.info(f"음성 분석 프로필 로드 중: {tp_path}")
         with open(tp_path, "r", encoding="utf-8") as f:
@@ -326,6 +367,8 @@ def main():
         if args.profile_only: continue
 
         dial_flat_list = []
+        # Scene JSON is nested, but translation runs over a flat list so chunking
+        # and context windows behave consistently across scenes and choices.
         # Scenes 내부 데이터 평탄화
         for s in quest.get("Scenes", []):
             for d in s.get("Dials", []):
@@ -371,6 +414,8 @@ def main():
             
             # 번역 대상이 이미 채워져 있는지 확인 (중복 번역 방지 로직은 필요시 추가)
             translate_scene_recursive(chunk, backend, mod_stem, recent_context, q_profile, glossary_text, rag, tone_profiles)
+            # Keep a short trailing window so adjacent chunks stay coherent
+            # without letting prompts grow indefinitely.
             recent_context = chunk[-5:]
 
             # 중간 저장 (실시간 반영)
@@ -383,6 +428,12 @@ def main():
     from llm_backend import Min1AIBackend
     if Min1AIBackend.total_used_credit > 0:
         log.info(f"\n[결산] 이번 세션에서 사용된 총 1min.ai 크레딧: {Min1AIBackend.total_used_credit}")
+    print_ok(out_path if not args.profile_only else profile_path)
+    return EXIT_SUCCESS
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(EXIT_INTERNAL_ERROR)

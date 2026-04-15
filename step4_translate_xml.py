@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import signal
+import sys
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -10,6 +11,20 @@ from typing import Dict, List, Tuple
 
 from db_manager import DBRAG, load_glossary_db
 from llm_backend import get_llm_backend
+from pipeline_runner import (
+    EXIT_ARGUMENT_ERROR,
+    EXIT_INPUT_MISSING,
+    EXIT_INTERNAL_ERROR,
+    EXIT_SUCCESS,
+    ensure_parent,
+    print_ok,
+    require_file,
+)
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # =============================================================================
 # ⚙️ 설정 (CONFIG)
@@ -423,9 +438,11 @@ signal.signal(signal.SIGTERM, signal_handler)
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser("Step 4 XML Translator (5-Step Optimized)")
-    parser.add_argument("-i", "--input", required=True, help="Path to input XML")
+    parser.add_argument("--input-xml", dest="input_xml", default=None, help="Standardized input XML path")
+    parser.add_argument("--output-xml", dest="output_xml", default=None, help="Standardized output XML path")
+    parser.add_argument("-i", "--input", required=False, help="Path to input XML")
     parser.add_argument(
-        "-o", "--output", default="translate_full.xml", help="Path to output XML"
+        "-o", "--output", default=None, help="Path to output XML"
     )
     parser.add_argument(
         "--use-ja-ref", action="store_true", help="일본어 원문 참조 모드 활성"
@@ -435,8 +452,21 @@ def main():
     )
     args = parser.parse_args()
 
-    target_xml = args.input
-    progress_path = Path(args.output).with_suffix(".progress.xml")
+    args.input = args.input_xml or args.input
+    args.output = args.output_xml or args.output
+    if not args.input or not args.output:
+        print("Error: --input-xml and --output-xml are required.", file=sys.stderr)
+        return EXIT_ARGUMENT_ERROR
+
+    try:
+        input_xml = require_file(args.input, "input XML")
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return EXIT_INPUT_MISSING
+
+    output_xml = ensure_parent(args.output)
+    target_xml = str(input_xml)
+    progress_path = output_xml.with_suffix(".progress.xml")
     if progress_path.exists():
         log.info(f"임시 작업 파일 발견! 이어하기를 시도합니다: {progress_path.name}")
         target_xml = str(progress_path)
@@ -629,8 +659,8 @@ def main():
         tree.write(str(progress_path), encoding="utf-8", xml_declaration=True)
         log.info(f"⚠️ 중지됨. 진행 상황 보존: {progress_path}")
     else:
-        tree.write(str(args.output), encoding="utf-8", xml_declaration=True)
-        log.info(f"✅ Step 4 완벽히 완료! 결과물 저장: {args.output}")
+        tree.write(str(output_xml), encoding="utf-8", xml_declaration=True)
+        log.info(f"✅ Step 4 완벽히 완료! 결과물 저장: {output_xml}")
         if progress_path.exists():
             progress_path.unlink()
 
@@ -638,7 +668,15 @@ def main():
     from llm_backend import Min1AIBackend
     if Min1AIBackend.total_used_credit > 0:
         log.info(f"\n[결산] 이번 세션에서 사용된 총 1min.ai 크레딧: {Min1AIBackend.total_used_credit}")
+    if not b_stop_requested:
+        print_ok(output_xml)
+        return EXIT_SUCCESS
+    return EXIT_SUCCESS
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(EXIT_INTERNAL_ERROR)
