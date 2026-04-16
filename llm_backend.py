@@ -12,6 +12,10 @@ import logging
 import json
 import random
 from typing import Dict, Any, List, Optional, Union
+from dotenv import load_dotenv
+
+# .env 파일 로드
+load_dotenv()
 
 log = logging.getLogger("LLMBackend")
 
@@ -618,26 +622,30 @@ def get_llm_backend(config_dict, step_prompt_key, role=None, max_retries=3, retr
     system_instruction = config_dict.get(step_prompt_key, "")
     
     if provider == "vertexai":
-        project_id = config_dict.get("gcp_project_id", "")
-        location = config_dict.get("gcp_location", "asia-northeast1")
+        project_id = os.getenv("GCP_PROJECT_ID") or config_dict.get("gcp_project_id", "")
+        location = os.getenv("GCP_LOCATION") or config_dict.get("gcp_location", "asia-northeast1")
         
-        key_json_path = config_dict.get("gcp_key_json", "")
+        key_json_path = os.getenv("GCP_KEY_JSON") or config_dict.get("gcp_key_json", "")
         if key_json_path and os.path.exists(key_json_path):
             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_json_path
             
         return VertexBackend(project_id, location, model_name, system_instruction, max_retries, retry_base_wait)
     elif provider == "gemini":
-        api_key = _deobfuscate(config_dict.get("gemini_api_key", ""))
+        env_key = os.getenv("GEMINI_API_KEY")
+        api_key = _deobfuscate(env_key) if env_key else _deobfuscate(config_dict.get("gemini_api_key", ""))
         return GeminiBackend(api_key, model_name, system_instruction, max_retries, retry_base_wait)
     elif provider == "openai":
-        api_key = _deobfuscate(config_dict.get("openai_api_key", ""))
+        env_key = os.getenv("OPENAI_API_KEY")
+        api_key = _deobfuscate(env_key) if env_key else _deobfuscate(config_dict.get("openai_api_key", ""))
         return OpenAIBackend(api_key, model_name, system_instruction, max_retries, retry_base_wait)
     elif provider == "localllm":
-        base_url = config_dict.get("localllm_base_url", "http://localhost:11434/v1")
-        api_key = _deobfuscate(config_dict.get("localllm_api_key", ""))
+        base_url = os.getenv("LOCALL_LLM_BASE_URL") or config_dict.get("localllm_base_url", "http://localhost:11434/v1")
+        env_key = os.getenv("LOCALL_LLM_API_KEY")
+        api_key = _deobfuscate(env_key) if env_key else _deobfuscate(config_dict.get("localllm_api_key", ""))
         return LocalLLMBackend(base_url, api_key, model_name, system_instruction, max_retries, retry_base_wait)
     elif provider == "1minai":
-        api_key = _deobfuscate(config_dict.get("1minai_api_key", ""))
+        env_key = os.getenv("MIN1AI_API_KEY")
+        api_key = _deobfuscate(env_key) if env_key else _deobfuscate(config_dict.get("1minai_api_key", ""))
         return Min1AIBackend(api_key, model_name, system_instruction, max_retries, retry_base_wait)
     else:
         raise ValueError(f"Unknown API provider: {provider}")

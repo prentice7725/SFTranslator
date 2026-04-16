@@ -486,26 +486,20 @@ def main():
         from orchestrator import TranslationOrchestrator
         orch_cfg = config.get("orchestrator", {})
         if orch_cfg.get("enabled"):
-            log.info("Step 4: 멀티 모델 오케스트레이터 모드 활성화")
-            gen_backends = []
-            glossary_dict = load_glossary_db()
-            glossary_text = "\n".join([f"- {k}: {v}" for k, v in glossary_dict.items()])
-            
-            for m in orch_cfg.get("generation_models", []):
-                m_config = config.copy()
-                m_config["api_provider"] = m["provider"]
-                m_config["model_name"] = m["model"]
-                persona_prompt = f"{config.get('step4_prompt', '')}\n\n[페르소나] {m['persona']}"
-                m_config["_temp_prompt"] = persona_prompt
-                gen_backends.append(get_llm_backend(m_config, "_temp_prompt"))
-            
+            # [사용자 요청] Step 4는 단문 위주이므로 오케스트레이터를 생략하고 
+            # 감수용 고성능 모델(Review Model) 단독으로 처리하여 속도/비용 최적화
             review_cfg = orch_cfg.get("review_model", {})
             r_config = config.copy()
-            r_config["api_provider"] = review_cfg["provider"]
-            r_config["model_name"] = review_cfg["model"]
-            review_backend = get_llm_backend(r_config, "step4_prompt")
+            r_config["provider"] = review_cfg.get("provider", config.get("provider"))
+            r_config["model_name"] = review_cfg.get("model", config.get("model_name"))
             
-            backend = TranslationOrchestrator(gen_backends, review_backend, glossary_text=glossary_text)
+            log.info(f"🚀 Step 4: 오케스트레이터를 우회하여 고성능 모델({r_config['model_name']})로 직접 번역합니다.")
+            backend = get_llm_backend(
+                r_config, 
+                "step4_prompt",
+                max_retries=Config.MAX_RETRIES,
+                retry_base_wait=Config.RETRY_BASE_WAIT
+            )
         else:
             backend = get_llm_backend(
                 config,

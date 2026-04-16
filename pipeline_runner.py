@@ -53,6 +53,7 @@ STEP_SPECS: dict[str, StepSpec] = {
     "audio_extract": StepSpec("audio_extract", "extract_audio.py", ("step1_priority",), ("step3_audio_dir",), optional=True),
     "audio_profile": StepSpec("audio_profile", "audition_profiler.py", ("step1_priority",), ("audio_tone_profile",), optional=True),
     "step2": StepSpec("step2", "step2_translate_scene.py", ("step1_dump",), ("step2_translated", "step2_profile")),
+    "review_step2": StepSpec("review_step2", "step5_review_xml.py", ("step2_translated",), ("step2_reviewed", "step2_scan")),
     "step3": StepSpec("step3", "step3_build_xml.py", ("step0_xml", "step2_translated"), ("step3_merged",)),
     "step4": StepSpec("step4", "step4_translate_xml.py", ("step3_merged",), ("step4_translated",)),
     "step5": StepSpec("step5", "step5_review_xml.py", ("step4_translated",), ("step5_reviewed", "step5_scan")),

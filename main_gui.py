@@ -263,6 +263,10 @@ class MainApp(QMainWindow):
         self.auto_audio_check.setChecked(self.config_mgr.config.get("auto_audio_analysis", False))
         form.addRow("오디오 연동:", self.auto_audio_check)
 
+        self.auto_resume_check = QCheckBox("🌟 기존 작업 재거(Resume) - 결과 파일이 있으면 건너뛰기")
+        self.auto_resume_check.setChecked(True) # 기본적으로 켜둠 (안전/절약)
+        form.addRow("재개 설정:", self.auto_resume_check)
+
         layout.addWidget(group)
 
         self.auto_start_btn = QPushButton("🚀 자동 번역 파이프라인 시작")
@@ -328,7 +332,8 @@ class MainApp(QMainWindow):
         
         self.run_background_task("AutoPipeline", {
             "input": self.auto_input_path.text(),
-            "config": "config.json"
+            "config": "config.json",
+            "resume": self.auto_resume_check.isChecked()
         }, self.auto_stop_btn)
 
     # ==========================

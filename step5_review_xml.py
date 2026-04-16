@@ -367,16 +367,21 @@ def review_step2_json(args) -> int:
         log.error(f"LLM 초기화 실패: {e}")
         return EXIT_INTERNAL_ERROR
 
+    # 퀘스트/배치 리스트 구조 대응
+    quests = data if isinstance(data, list) else data.get("Quests", [])
+    
     scan_report = {"total": 0, "reviewed": 0, "untranslated_fixed": 0, "tag_errors_fixed": 0, "items": []}
     
-    scenes = data.get("scenes", [])
-    for scene in scenes:
-        for idx, line in enumerate(scene.get("lines", [])):
+    # 계층 구조 순회용 도우미 함수
+    def process_dialogue_list(dialogues):
+        for item in dialogues:
+            src = item.get("Text", "")
+            dst = item.get("Translate", "")
+            speaker = item.get("Speaker", "Unknown")
+            string_id = item.get("StringID", "0")
+            
+            if not src: continue
             scan_report["total"] += 1
-            src = line.get("english", "")
-            dst = line.get("korean", "")
-            speaker = line.get("speaker_name", "")
-            form_id = line.get("form_id", "")
             
             needs_review = False
             issue_type = ""
@@ -402,25 +407,39 @@ def review_step2_json(args) -> int:
                     res = backend.generate_content(prompt, temperature=0.2)
                     fixed = " ".join(res.split()) if res else dst
                     if fixed and fixed != dst:
-                        line["korean"] = fixed
+                        item["Translate"] = fixed
                         scan_report["reviewed"] += 1
                         if issue_type == "untranslated": scan_report["untranslated_fixed"] += 1
                         else: scan_report["tag_errors_fixed"] += 1
                         
                         scan_report["items"].append({
-                            "form_id": form_id,
+                            "string_id": string_id,
                             "speaker": speaker,
                             "issue": issue_type,
                             "original": src,
-                            "fixed": fixed,
-                            "tone_used": tone.get("tone", "unknown") if tone else "unknown"
+                            "fixed": fixed
                         })
                 except Exception as e:
-                    log.warning(f"교정 실패 ({form_id}): {e}")
+                    log.warning(f"교정 실패 ({string_id}): {e}")
+            
+            # 선택지(Choices)도 처리
+            if "PlayerChoices" in item:
+                process_dialogue_list(item["PlayerChoices"])
+
+    for quest in quests:
+        if not isinstance(quest, dict): continue
+        # 1. Scenes 내부 순회
+        for scene in quest.get("Scenes", []):
+            for dial in scene.get("Dials", []):
+                process_dialogue_list(dial.get("Dialogues", []))
+        
+        # 2. StandaloneDials 순회
+        for dial in quest.get("StandaloneDials", []):
+            process_dialogue_list(dial.get("Dialogues", []))
                     
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-        
+    
     with open(scan_file, "w", encoding="utf-8") as f:
         json.dump(scan_report, f, ensure_ascii=False, indent=2)
         

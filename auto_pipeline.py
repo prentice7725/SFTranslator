@@ -47,14 +47,27 @@ def detect_branch(step1_dump_json: Path) -> str:
     Returns:
         "scene"      - dialogue/quest 있음 -> scene 번역 경로
         "direct_xml" - 내용 없음 -> XML 직행 경로
+
+    step1 dump JSON 구조:
+        리스트 형태 [{ "QuestID": ..., "Scenes": [...], "StandaloneDials": [...] }, ...]
+        각 배치에 Scenes 또는 StandaloneDials에 항목이 하나라도 있으면 scene 분기로 판정
     """
     if not step1_dump_json.exists():
         return "direct_xml"
     
     try:
         data = json.loads(step1_dump_json.read_text(encoding="utf-8"))
-        if data.get("scenes") and len(data["scenes"]) > 0:
-            return "scene"
+        # dump JSON은 배치 리스트 형태: [{"Scenes": [...], "StandaloneDials": [...], ...}, ...]
+        if isinstance(data, list):
+            for batch in data:
+                if batch.get("Scenes") and len(batch["Scenes"]) > 0:
+                    return "scene"
+                if batch.get("StandaloneDials") and len(batch["StandaloneDials"]) > 0:
+                    return "scene"
+        elif isinstance(data, dict):
+            # 혹시 dict 형태일 경우 대소문자 모두 처리
+            if data.get("scenes") or data.get("Scenes"):
+                return "scene"
     except Exception:
         pass
     return "direct_xml"
@@ -84,9 +97,10 @@ class AutoPipeline:
     def _should_skip(self, step_name: str) -> bool:
         if not self.resume:
             return False
-        # Resume only skips a step when both the manifest and the expected
-        # outputs agree that the step really finished.
-        return self.manifest.get_status(step_name) == "done" and self._step_output_exists(step_name)
+        # Resume only skips a step if the expected outputs exist on disk.
+        # We also acknowledge the manifest "done" status, but file existence
+        # is the most reliable source of truth for potential recovery.
+        return self._step_output_exists(step_name)
 
     def _copy_final_output(self) -> None:
         # The pipeline always publishes one stable "final" file even though
@@ -121,7 +135,8 @@ class AutoPipeline:
                 return EXIT_SUCCESS
             command = build_step_command(
                 step_name,
-                config=self.config_path,
+                config=self.config,
+                config_path=self.config_path,
                 priority_list=self.paths.step1_priority,
                 audition_dir=self.paths.step3_audio_dir,
                 output=self.paths.audio_tone_profile,
@@ -281,14 +296,14 @@ class AutoPipeline:
             # audio_profile: string일 경우 내부적으로 모드 처리
             if step_name == "audio_profile" and tone_method == "string":
                 # build_step_command에서 --mode string, --input-json 주입을 위해 _run_step 오버라이드
-                # 여기서는 직접 하드코딩
                 command = build_step_command(
                     "audio_profile",
-                    config=self.config,
-                    config_path=self.config_path,
+                    config=self.config,          # dict
+                    config_path=self.config_path, # 경로
                     mode="string",
                     input_json=self.paths.step1_dump,
-                    output=self.paths.audio_tone_profile
+                    output=self.paths.audio_tone_profile,
+                    priority_list=self.paths.step1_priority,
                 )
                 self.manifest.update_step(step_name, status="running", command=[str(part) for part in command])
                 print(f"[RUN] {step_name}: {' '.join(str(part) for part in command)}")
