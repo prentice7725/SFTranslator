@@ -1,11 +1,11 @@
 # Starfield Translation Automation
 
 Starfield 모드 번역용 자동화 도구다.  
-`ESM/ESP -> Scene 추출 -> Scene 번역 -> XML 생성 -> XML 후반 번역 -> 검수` 흐름을 지원한다.
+`ESM/ESP -> Scene 추출 -> Scene 번역 -> XML 생성 -> XML 후반 번역 -> 검수 -> 모드 최종 패치(ESM/Strings 빌드)` 흐름을 지원한다.
 
 현재 구조의 핵심은 다음과 같다.
 
-- `step0` ~ `step6` CLI가 실제 엔진
+- `step0` ~ `step7` CLI가 실제 엔진
 - `auto_pipeline.py`는 얇은 오케스트레이터
 - `main_gui.py`는 GUI 실행기
 - `pipeline_runner.py`가 공통 실행 계약과 산출물 규칙을 관리
@@ -15,7 +15,7 @@ Starfield 모드 번역용 자동화 도구다.
 ```text
 GUI / auto_pipeline
   -> pipeline_runner
-    -> step0 ~ step6 CLI
+    -> step0 ~ step7 CLI
 ```
 
 ## 주요 파일
@@ -32,6 +32,7 @@ GUI / auto_pipeline
 - `step4_translate_xml.py`: XML 후반 번역
 - `step5_review_xml.py`: 스캔 / 검수 / 선택 번역
 - `step6_mod_update.py`: refine / update 보정
+- `step7_esm_builder.py`: Python 네이티브 다국어(.strings) 파일 및 ESM 무결성 빌더
 - `db_manager.py`: SQLite + RAG
 - `llm_backend.py`: LLM 백엔드 추상화
 - `orchestrator.py`: 멀티 모델 generation + review
@@ -52,6 +53,7 @@ GUI / auto_pipeline
 - `mod.step5.scan.json`
 - `mod.step6.refined.xml`
 - `mod.final.xml`
+- `mod_Translated/mod.esm` (최종 완성된 패치 폴더 및 Strings 파일들)
 - `mod.pipeline_manifest.json`
 
 ## 실행 순서
@@ -60,12 +62,12 @@ GUI / auto_pipeline
 
 **[경로 A] 대화(Scene)가 존재할 때**
 ```text
-step0 -> step1 -> audio_extract/profile -> step2 -> review_step2 -> step3 -> step4 -> step5
+step0 -> step1 -> audio_extract/profile -> step2 -> review_step2 -> step3 -> step4 -> step5 -> (step6) -> step7
 ```
 
 **[경로 B] 일반 텍스트만 존재할 때**
 ```text
-step0 -> step1 -> step3(direct-build) -> step4 -> step5
+step0 -> step1 -> step3(direct-build) -> step4 -> step5 -> (step6) -> step7
 ```
 
 선택적으로 Step 6을 포함할 수 있다.
@@ -134,10 +136,10 @@ resume:
 python auto_pipeline.py --input-esp path\\to\\mod.esm --config config.json --resume
 ```
 
-Step 6 포함:
+Step 6 포함 및 Step 7 (ESM 자동 빌드):
 
 ```bash
-python auto_pipeline.py --input-esp path\\to\\mod.esm --config config.json --include-step6
+python auto_pipeline.py --input-esp path\\to\\mod.esm --config config.json --include-step6 --include-step7
 ```
 
 특정 단계부터 시작:
@@ -235,6 +237,15 @@ python step6_mod_update.py \
   --profile-json mod.step2.profile.json
 ```
 
+### Step 7 (ESM 네이티브 패처)
+
+```bash
+python step7_esm_builder.py \
+  --input-esp mod.esm \
+  --input-xml mod.final.xml \
+  --output-dir mod_Translated
+```
+
 ## 실행 계약
 
 ### 종료 코드
@@ -264,6 +275,7 @@ python step6_mod_update.py \
 - **프로세스 제어**: GUI 중지 시 `taskkill` 기반 자식 프로세스 강제 종료 트리 기능 도입 (API 누수 차단)
 - **API 비용 보호**: Step 2 / Step 4 진행 중 `.progress` 파일 수시 저장으로 크래시 전 과정 복구 지원
 - **오케스트레이터 강화**: 멀티 모델 판단 로그 저장 및 작업 폴더(`work_dir`) 기반 캐시 자동 클린업 적용
+- **xTranslator 독립 (ESM Builder)**: ESM의 로컬라이즈 상태를 판단하여 `.strings` 파일을 빌드하거나 메모리 파싱으로 ZLib 압축 및 오프셋을 역산하여 바이너리에 직접 주입하는 100% 네이티브 엔진 도입.
 
 이미 확인한 것:
 

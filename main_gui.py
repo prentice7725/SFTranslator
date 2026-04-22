@@ -217,6 +217,7 @@ class MainApp(QMainWindow):
         self.tabs.addTab(self.create_step4_tab(), "Step 4: XML 번역")
         self.tabs.addTab(self.create_step5_tab(), "Step 5: 미번역 보완+태그 검사")
         self.tabs.addTab(self.create_step6_tab(), "Step 6: 모드/DLC 번역 교정")
+        self.tabs.addTab(self.create_step7_tab(), "Step 7: ESM 빌드 및 패치")
         self.tabs.addTab(self.create_audio_tab(), "멀티모달 오디오 오디션")
 
         self.status_log = QTextEdit()
@@ -266,6 +267,14 @@ class MainApp(QMainWindow):
         self.auto_resume_check = QCheckBox("🌟 기존 작업 재거(Resume) - 결과 파일이 있으면 건너뛰기")
         self.auto_resume_check.setChecked(True) # 기본적으로 켜둠 (안전/절약)
         form.addRow("재개 설정:", self.auto_resume_check)
+
+        self.auto_step6_check = QCheckBox("Step 6: 완료 후 어투 자동 교정 (Refine) 추가 실행")
+        self.auto_step6_check.setChecked(False)
+        form.addRow("추가 단계:", self.auto_step6_check)
+
+        self.auto_step7_check = QCheckBox("Step 7: 번역 완료 후 즉시 원본 모드에 덮어쓰기 (네이티브 ESM 빌드)")
+        self.auto_step7_check.setChecked(True)
+        form.addRow("자동 패치:", self.auto_step7_check)
 
         layout.addWidget(group)
 
@@ -333,7 +342,9 @@ class MainApp(QMainWindow):
         self.run_background_task("AutoPipeline", {
             "input": self.auto_input_path.text(),
             "config": "config.json",
-            "resume": self.auto_resume_check.isChecked()
+            "resume": self.auto_resume_check.isChecked(),
+            "include_step6": self.auto_step6_check.isChecked(),
+            "include_step7": self.auto_step7_check.isChecked()
         }, self.auto_stop_btn)
 
     # ==========================
@@ -1451,7 +1462,97 @@ class MainApp(QMainWindow):
         self.run_background_task("Step6", kwargs, self.s6_stop_btn)
 
     # ==========================
-    # 9. 멀티모달 오디오 오디션 탭
+    # 9. Step 7: ESM/Strings 패치
+    # ==========================
+    def create_step7_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        group = QGroupBox("입출력 파일 설정")
+        form = QFormLayout(group)
+
+        self.s7_input_esp = QLineEdit()
+        btn_in_esp = QPushButton("원본 모드 파일(.esm/esp) 찾기")
+        btn_in_esp.clicked.connect(self.browse_step7_input_esp)
+        row1 = QHBoxLayout()
+        row1.addWidget(self.s7_input_esp)
+        row1.addWidget(btn_in_esp)
+        form.addRow("원본 ESM/ESP 파일:", row1)
+
+        self.s7_input_xml = QLineEdit()
+        btn_in_xml = QPushButton("번역된 XML 찾기")
+        btn_in_xml.clicked.connect(self.browse_step7_input_xml)
+        row2 = QHBoxLayout()
+        row2.addWidget(self.s7_input_xml)
+        row2.addWidget(btn_in_xml)
+        form.addRow("최종 번역된 XML:", row2)
+
+        self.s7_output_dir = QLineEdit()
+        btn_out_dir = QPushButton("저장 폴더 찾기")
+        btn_out_dir.clicked.connect(lambda: self.browse_folder(self.s7_output_dir))
+        row3 = QHBoxLayout()
+        row3.addWidget(self.s7_output_dir)
+        row3.addWidget(btn_out_dir)
+        form.addRow("출력 저장 폴더:", row3)
+
+        layout.addWidget(group)
+
+        desc = QLabel("이 단계는 외부 도구 없이 Python 100% 네이티브로 다국어화(Strings) 판단 및 ESM 무결성 빌드를 자동으로 수행합니다.")
+        desc.setStyleSheet("color: #555; margin: 10px 0;")
+        layout.addWidget(desc)
+
+        btn_run = QPushButton("Step 7 네이티브 ESM 빌드 실행")
+        btn_run.setMinimumHeight(40)
+        btn_run.setStyleSheet("background-color: #f57c00; color: white; font-weight: bold;")
+        self.s7_stop_btn = QPushButton("작업 중지")
+        self.s7_stop_btn.setEnabled(False)
+
+        btn_run.clicked.connect(self.run_step7)
+        self.s7_stop_btn.clicked.connect(self.stop_current_task)
+
+        h_btn = QHBoxLayout()
+        h_btn.addWidget(btn_run)
+        h_btn.addWidget(self.s7_stop_btn)
+        layout.addLayout(h_btn)
+
+        layout.addStretch()
+        return widget
+
+    def browse_step7_input_esp(self):
+        path, _ = QFileDialog.getOpenFileName(self, "ESM/ESP 파일 선택", "", "Bethesda Plugin Files (*.esm *.esp);;All Files (*)")
+        if path:
+            self.s7_input_esp.setText(path)
+            dir_name = os.path.dirname(path)
+            base_name = os.path.splitext(os.path.basename(path))[0]
+            self.s7_output_dir.setText(os.path.join(dir_name, f"{base_name}_Translated"))
+
+    def browse_step7_input_xml(self):
+        path, _ = QFileDialog.getOpenFileName(self, "XML 파일 선택", "", "XML Files (*.xml);;All Files (*)")
+        if path:
+            self.s7_input_xml.setText(path)
+
+    def run_step7(self):
+        inp_esp = self.s7_input_esp.text().strip()
+        inp_xml = self.s7_input_xml.text().strip()
+        out_dir = self.s7_output_dir.text().strip()
+
+        if not inp_esp or not inp_xml:
+            QMessageBox.warning(self, "경고", "원본 ESM 파일과 번역된 XML 파일을 모두 지정하세요.")
+            return
+
+        kwargs = {
+            "input_esp": inp_esp,
+            "input_xml": inp_xml,
+            "config": "config.json"
+        }
+        if out_dir:
+            kwargs["output_dir"] = out_dir
+
+        self.current_stop_btn = self.s7_stop_btn
+        self.run_background_task("step7", kwargs, self.s7_stop_btn)
+
+    # ==========================
+    # 10. 멀티모달 오디오 오디션 탭
     # ==========================
     def create_audio_tab(self):
         widget = QWidget()

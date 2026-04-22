@@ -34,6 +34,7 @@ class PipelinePaths:
     step5_reviewed: Path
     step5_scan: Path
     step6_refined: Path
+    step7_output_dir: Path
     final_xml: Path
     manifest: Path
 
@@ -58,6 +59,7 @@ STEP_SPECS: dict[str, StepSpec] = {
     "step4": StepSpec("step4", "step4_translate_xml.py", ("step3_merged",), ("step4_translated",)),
     "step5": StepSpec("step5", "step5_review_xml.py", ("step4_translated",), ("step5_reviewed", "step5_scan")),
     "step6": StepSpec("step6", "step6_mod_update.py", ("step5_reviewed",), ("step6_refined",), optional=True),
+    "step7": StepSpec("step7", "step7_esm_builder.py", ("final_xml",), ("step7_output_dir",), optional=True),
 }
 
 
@@ -85,6 +87,7 @@ def build_job_paths(input_esp: str | Path, work_dir: str | Path | None = None) -
         step5_reviewed=job_dir / f"{stem}.step5.reviewed.xml",
         step5_scan=job_dir / f"{stem}.step5.scan.json",
         step6_refined=job_dir / f"{stem}.step6.refined.xml",
+        step7_output_dir=job_dir / f"{stem}_Translated",
         final_xml=job_dir / f"{stem}.final.xml",
         manifest=job_dir / f"{stem}.pipeline_manifest.json",
     )
@@ -99,6 +102,7 @@ def normalize_step_name(step_name: str) -> str:
         "step4": "step4",
         "step5": "step5",
         "step6": "step6",
+        "step7": "step7",
         "audioextract": "audio_extract",
         "audio_extract": "audio_extract",
         "audioprofile": "audio_profile",
@@ -143,6 +147,8 @@ def build_step_command(step_name: str, config: dict | None = None, **kwargs: Any
             parts.append("--resume")
         if kwargs.get("include_step6"):
             parts.append("--include-step6")
+        if kwargs.get("include_step7"):
+            parts.append("--include-step7")
         if kwargs.get("from_step") is not None:
             parts.extend(["--from-step", kwargs["from_step"]])
         if kwargs.get("work_dir"):
@@ -315,6 +321,20 @@ def build_step_command(step_name: str, config: dict | None = None, **kwargs: Any
             parts.extend(["--reference", kwargs["reference"]])
         return _stringify_command(parts)
 
+    if normalized == "step7":
+        parts = [
+            "step7_esm_builder.py",
+            "--input-esp",
+            kwargs.get("input_esp"),
+            "--input-xml",
+            kwargs.get("input_xml") or kwargs.get("input"),
+            "--config",
+            kwargs.get("config", "config.json")
+        ]
+        if kwargs.get("output_dir") or kwargs.get("output"):
+            parts.extend(["--output-dir", kwargs.get("output_dir") or kwargs.get("output")])
+        return _stringify_command(parts)
+
     raise ValueError(f"Unsupported step name: {step_name}")
 
 
@@ -350,6 +370,7 @@ def get_step_sequence(include_step6: bool = False, include_audio: bool = True) -
     steps.extend(["step2", "step3", "step4", "step5"])
     if include_step6:
         steps.append("step6")
+    steps.append("step7")
     return steps
 
 

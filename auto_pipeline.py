@@ -73,12 +73,13 @@ def detect_branch(step1_dump_json: Path) -> str:
     return "direct_xml"
 
 class AutoPipeline:
-    def __init__(self, input_esp: str, config_path: str, from_step: str = "step0", include_step6: bool = False, resume: bool = False, work_dir: str | None = None, branch: str | None = None, tone_method: str | None = None, skip_review_step2: bool = False):
+    def __init__(self, input_esp: str, config_path: str, from_step: str = "step0", include_step6: bool = False, include_step7: bool = False, resume: bool = False, work_dir: str | None = None, branch: str | None = None, tone_method: str | None = None, skip_review_step2: bool = False):
         self.paths = build_job_paths(input_esp, work_dir)
         self.config_path = Path(config_path).expanduser().resolve()
         self.config = load_config(self.config_path)
         self.from_step = from_step
         self.include_step6 = include_step6
+        self.include_step7 = include_step7
         self.resume = resume
         self.branch_override = branch
         self.tone_method_override = tone_method
@@ -214,6 +215,13 @@ class AutoPipeline:
                 output_xml=self.paths.step6_refined,
                 profile_json=self.paths.step2_profile,
             )
+        elif step_name == "step7":
+            command = build_step_command(
+                step_name,
+                input_esp=self.paths.input_esp,
+                input_xml=self.paths.final_xml,
+                config=self.config_path
+            )
         else:
             raise ValueError(f"Unsupported step: {step_name}")
 
@@ -279,6 +287,8 @@ class AutoPipeline:
         subsequent_steps.extend(["step4", "step5"])
         if self.include_step6:
             subsequent_steps.append("step6")
+        if self.include_step7:
+            subsequent_steps.append("step7")
 
         for step_name in subsequent_steps:
             # from_step이 여기에 있을 경우 시작 시점 처리
@@ -332,6 +342,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--from-step", default="step0", choices=get_step_sequence(include_step6=True, include_audio=True), help="Step to start from")
     parser.add_argument("-s", "--step", dest="legacy_step", default=None, help="Legacy start step alias")
     parser.add_argument("--include-step6", action="store_true", help="Include Step 6 refine pass")
+    parser.add_argument("--include-step7", action="store_true", help="Include Step 7 ESM update pass via xTranslator")
     parser.add_argument("--resume", action="store_true", help="Resume from manifest and skip completed steps")
     parser.add_argument("--work-dir", default=None, help="Optional working directory for pipeline outputs")
     parser.add_argument("--branch", choices=["scene", "direct_xml"], help="Branch type override (scene | direct_xml)")
@@ -349,6 +360,7 @@ def _parse_args() -> argparse.Namespace:
             "4": "step4",
             "5": "step5",
             "6": "step6",
+            "7": "step7",
         }
         args.from_step = step_alias_map.get(str(args.legacy_step), args.from_step)
     return args
@@ -365,6 +377,7 @@ def main() -> int:
             config_path=args.config,
             from_step=args.from_step,
             include_step6=args.include_step6,
+            include_step7=args.include_step7,
             resume=args.resume,
             work_dir=args.work_dir,
             branch=args.branch,
