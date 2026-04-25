@@ -216,10 +216,12 @@ class AutoPipeline:
                 profile_json=self.paths.step2_profile,
             )
         elif step_name == "step7":
+            self._copy_final_output()
             command = build_step_command(
                 step_name,
                 input_esp=self.paths.input_esp,
                 input_xml=self.paths.final_xml,
+                output_dir=self.paths.step7_output_dir,
                 config=self.config_path
             )
         else:
@@ -328,7 +330,8 @@ class AutoPipeline:
                 if return_code != 0:
                     return return_code
 
-        self._copy_final_output()
+        if not self.paths.final_xml.exists():
+            self._copy_final_output()
         if self.paths.final_xml.exists():
             print_ok(self.paths.final_xml)
         return EXIT_SUCCESS
