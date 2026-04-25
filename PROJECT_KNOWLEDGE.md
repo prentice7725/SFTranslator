@@ -4,7 +4,7 @@
 
 이 프로젝트는 Starfield 모드 플러그인(`.esm`, `.esp`)의 문자열을 추출하고, AI(LLM)를 활용하여 고품질의 한국어 번역을 자동 수행하며, 최종적으로 모드에 적용 가능한 xTranslator 호환 XML 및 관련 파일을 생성하는 자동화 파이프라인이다.
 
-현재 프로젝트는 기존 **Python 기반 Prototype(`SFTranslator`)**에서 **Node.js/Electron 기반 Desktop App(`SFTranNode`)**으로 전환 및 고도화되는 과정에 있다.
+현재 프로젝트는 **Python 기반 기준 엔진(`SFTranslator`)**이며, 별도 폴더의 **Node.js/Electron 기반 Desktop App(`SFTranNode`)**으로 전환 및 고도화되는 과정에 있다. Python 구현은 여전히 CLI 계약, 산출물 이름, 번역/검수 흐름의 기준점이다.
 
 ### 주요 기능
 - **ESM/ESP 레코드 파싱**: 성격이 다른 다양한 레코드에서 번역 가능한 텍스트 추출.
@@ -18,8 +18,8 @@
 
 ## 2. 프로젝트 구조 (Dual-Stack)
 
-### [Prototype] SFTranslator (Python)
-- **성격**: 핵심 로직의 검증 및 초기 파이프라인 수립용.
+### [Reference Engine] SFTranslator (Python)
+- **성격**: 핵심 로직, CLI 계약, 산출물 규칙의 기준 구현.
 - **핵심 파일**:
   - `auto_pipeline.py`: 단계별 CLI를 호출하는 오케스트레이터.
   - `llm_backend.py`: 다중 LLM 지원 추상화 레이어.
@@ -28,12 +28,12 @@
 
 ### [Production] SFTranNode (Node.js/Electron)
 - **성격**: 사용자 편의성 강화 및 실제 배포용 데스크톱 애플리케이션.
-- **기술 스택**: Electron, Vite, TypeScript, React(Tailwind CSS/Airbnb Design System).
-- **진척 상황**: Python 기반의 Step 0~6 로직이 TypeScript로 모두 포팅 완료되었으며, 통합 테스트 및 UI 고도화 단계임.
+- **기술 스택**: Electron, electron-vite, TypeScript, vanilla renderer UI, Airbnb-inspired CSS.
+- **진척 상황**: Step 0~6, 자동 파이프라인, DB, LLM, IPC, UI 골격은 포팅되어 있다. Step 7 TypeScript 포팅은 아직 파일이 없으며, Python `step7_esm_builder.py`가 기준 구현이다.
 
 ---
 
-## 3. 핵심 파이프라인 흐름 (Step 0 ~ 6)
+## 3. 핵심 파이프라인 흐름 (Step 0 ~ 7)
 
 모든 작업은 `Input Mod` 하나를 기준으로 시작되며, 내부 문자열 구성에 따라 자동으로 분기된다.
 
@@ -70,7 +70,7 @@ graph TD
 - **XML 속성 중복 정의 오류 해결**: `step5_review_xml.py`에서 계층형 JSON 구조를 순회할 때, 부모와 자식 간의 데이터 전파 오류로 인한 XML 파싱 에러를 수정.
 - **자동 분기 로직(Branching) 안정화**: 모드 내에 Scene 데이터가 전혀 없는 경우에도 파이프라인이 멈추지 않고 바로 "Direct XML" 모드로 전환되도록 개선.
 - **Python 네이티브 ESM 빌더 통합 (Step 7)**: xTranslator 버전에 종속되어 업데이트마다 에러가 발생하던 문제를 해결. `0x80` 로컬라이즈 플래그를 판단해 자동으로 `.strings` 파일 생성 혹은 메모리 AST(Abstract Syntax Tree) 파싱 기반 ESM/ESP 직접 주입을 지원하는 독자적 엔진 적용.
-- **Node.js 포팅 완료**: `better-sqlite3`를 사용하여 DB 관리자를 구현하고, 기존 Python의 복잡한 로직(Scene 탐색, LLM 스트리밍 등)을 TS 환경으로 완전 이전.
+- **Node.js 포팅 진행**: `better-sqlite3` 기반 DB 관리자, Step 0~6, 자동 파이프라인, LLM 서비스, IPC 기반 UI 실행 흐름이 `SFTranNode`에 구현되어 있다. Step 7과 일부 상세 검수/재번역 UX는 Python 기준 구현과 비교 검증이 필요하다.
 - **프로세스 제어 강화**: GUI에서 작업 중단 시 자식 프로세스 트리를 강제 종료(`taskkill`)하여 불필요한 API 호출 및 리소스 점유 방지.
 - **Resume 기능**: 파일 존재 여부와 Manifest를 대조하여 중단된 단계부터 이어서 시작하는 기능 구현.
 
@@ -106,8 +106,8 @@ graph TD
 | **Scene (Step 1)** | `step1_extract_scene.py` | `src/steps/step1_extract_scene.ts` |
 | **번역/DB** | `db_manager.py` | `src/database/db_manager.ts` |
 | **LLM** | `llm_backend.py` | `src/services/llm_backend.ts` |
-| **ESM/Strings** | `step7_esm_builder.py` | `src/steps/step7_esm_builder.ts` |
+| **ESM/Strings** | `step7_esm_builder.py` | 미포팅 |
 | **UI** | `main_gui.py` | `src/renderer/` |
 
 ---
-**마지막 업데이트**: 2026-04-22
+**마지막 업데이트**: 2026-04-25

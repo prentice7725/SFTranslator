@@ -9,6 +9,7 @@ Starfield 모드 번역용 자동화 도구다.
 - `auto_pipeline.py`는 얇은 오케스트레이터
 - `main_gui.py`는 GUI 실행기
 - `pipeline_runner.py`가 공통 실행 계약과 산출물 규칙을 관리
+- `SFTranNode`는 별도 Electron/TypeScript 전환 프로젝트이며, 이 Python 프로젝트가 기능 기준점 역할을 한다.
 
 ## 구조
 
@@ -276,6 +277,7 @@ python step7_esm_builder.py \
 - **API 비용 보호**: Step 2 / Step 4 진행 중 `.progress` 파일 수시 저장으로 크래시 전 과정 복구 지원
 - **오케스트레이터 강화**: 멀티 모델 판단 로그 저장 및 작업 폴더(`work_dir`) 기반 캐시 자동 클린업 적용
 - **xTranslator 독립 (ESM Builder)**: ESM의 로컬라이즈 상태를 판단하여 `.strings` 파일을 빌드하거나 메모리 파싱으로 ZLib 압축 및 오프셋을 역산하여 바이너리에 직접 주입하는 100% 네이티브 엔진 도입.
+- **Node/Electron 전환 기준점**: `SFTranNode`에서 Step 0~6, 자동 파이프라인, DB/LLM/IPC/UI 포팅이 진행 중이며, Python 구현은 현재도 CLI 계약과 산출물 규칙의 기준 문서 역할을 한다.
 
 이미 확인한 것:
 
@@ -289,6 +291,7 @@ python step7_esm_builder.py \
 - `requirements.txt` 정리
 - 공통 문자열/태그 처리 모듈 분리
 - Step 5 UX 세부 검증
+- `SFTranNode`와 CLI 인자/산출물 이름 차이 정리
 
 ## 문서
 
