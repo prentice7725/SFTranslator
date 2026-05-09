@@ -229,6 +229,11 @@ def build_batch_prompt(masked_batch: list) -> str:
         payload.append(item)
 
     glossary_str = "\n".join(f"- {k}: {v}" for k, v in GLOSSARY.items())
+    glossary_instruction = (
+        "아래 용어집을 무조건 준수해:\n" + glossary_str
+        if glossary_str
+        else "용어집이 없습니다. 게임 문맥에 맞게 번역하세요."
+    )
 
     prompt = f"""번호 순서대로 주어진 'text' 요소들을 하나도 빠짐없이 전부 번역해 줘.
 작업할 개수: {len(masked_batch)}개
@@ -238,7 +243,7 @@ def build_batch_prompt(masked_batch: list) -> str:
 
 **지시사항:**
 1. [[TAG_n]] 형태의 플레이스홀더는 **절대 번역하거나 수정하지 말고** 원문 그대로 복사해 출력해.
-2. {"아래 용어집을 무조건 준수해:\n" + glossary_str if glossary_str else "용어집이 없습니다. 게임 문맥에 맞게 번역하세요."}
+2. {glossary_instruction}
 3. 모든 ID(0부터 {len(masked_batch) - 1}까지)를 결과 JSON 배열에 반드시 포함해야 해. 하나라도 누락되면 안 돼.
 4. 결과는 아래 예시처럼 JSON 배열 형태로만 줘. 여분의 설명은 절대 하지 마.
 
@@ -258,6 +263,11 @@ def translate_single_item(src: str, rec: str, backend, ja: str = None) -> str:
     """[Step 4] 장문 전용 1:1 단독 번역 처리기"""
     masked, tags = TagPreserver.mask_tags(src)
     g_str = "\n".join(f"- {k}: {v}" for k, v in GLOSSARY.items())
+    glossary_instruction = (
+        "아래 용어집을 무조건 준수해:\n" + g_str
+        if g_str
+        else "용어집이 없습니다."
+    )
 
     ja_info = f"\n**일본어 참조:**\n{ja}\n" if ja else ""
 
@@ -268,7 +278,7 @@ def translate_single_item(src: str, rec: str, backend, ja: str = None) -> str:
 
 **규칙:**
 1. [[TAG_n]] 플레이스홀더 절대 수정 금지
-2. {"아래 용어집을 무조건 준수해:\n" + g_str if g_str else "용어집이 없습니다."}
+2. {glossary_instruction}
 3. 번역문만 출력 (여타 설명 금지)
 4. rec 타입: {rec}
 
