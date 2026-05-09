@@ -29,6 +29,7 @@ class PipelinePaths:
     step2_profile: Path
     step2_reviewed: Path
     step2_scan: Path
+    step2_tone_refined: Path
     step3_merged: Path
     step4_translated: Path
     step5_reviewed: Path
@@ -55,6 +56,7 @@ STEP_SPECS: dict[str, StepSpec] = {
     "audio_profile": StepSpec("audio_profile", "audition_profiler.py", ("step1_priority",), ("audio_tone_profile",), optional=True),
     "step2": StepSpec("step2", "step2_translate_scene.py", ("step1_dump",), ("step2_translated", "step2_profile")),
     "review_step2": StepSpec("review_step2", "step5_review_xml.py", ("step2_translated",), ("step2_reviewed", "step2_scan")),
+    "scene_refine": StepSpec("scene_refine", "step6_mod_update.py", ("step2_reviewed", "step2_profile"), ("step2_tone_refined",), optional=True),
     "step3": StepSpec("step3", "step3_build_xml.py", ("step0_xml", "step2_translated"), ("step3_merged",)),
     "step4": StepSpec("step4", "step4_translate_xml.py", ("step3_merged",), ("step4_translated",)),
     "step5": StepSpec("step5", "step5_review_xml.py", ("step4_translated",), ("step5_reviewed", "step5_scan")),
@@ -82,6 +84,7 @@ def build_job_paths(input_esp: str | Path, work_dir: str | Path | None = None) -
         step2_profile=job_dir / f"{stem}.step2.profile.json",
         step2_reviewed=job_dir / f"{stem}.step2.reviewed.json",
         step2_scan=job_dir / f"{stem}.step2.scan.json",
+        step2_tone_refined=job_dir / f"{stem}.step2.tone_refined.json",
         step3_merged=job_dir / f"{stem}.step3.merged.xml",
         step4_translated=job_dir / f"{stem}.step4.translated.xml",
         step5_reviewed=job_dir / f"{stem}.step5.reviewed.xml",
@@ -102,6 +105,8 @@ def normalize_step_name(step_name: str) -> str:
         "step4": "step4",
         "step5": "step5",
         "step6": "step6",
+        "scene_refine": "scene_refine",
+        "scene_refine_step": "scene_refine",
         "step7": "step7",
         "audioextract": "audio_extract",
         "audio_extract": "audio_extract",
@@ -321,6 +326,20 @@ def build_step_command(step_name: str, config: dict | None = None, **kwargs: Any
             parts.extend(["--reference", kwargs["reference"]])
         return _stringify_command(parts)
 
+    if normalized == "scene_refine":
+        parts = [
+            "step6_mod_update.py",
+            "--mode",
+            "scene_refine",
+            "--input-json",
+            kwargs.get("input_json") or kwargs.get("input"),
+            "--output-json",
+            kwargs.get("output_json") or kwargs.get("output"),
+        ]
+        if kwargs.get("profile_json") or kwargs.get("profile"):
+            parts.extend(["--profile-json", kwargs.get("profile_json") or kwargs.get("profile")])
+        return _stringify_command(parts)
+
     if normalized == "step7":
         parts = [
             "step7_esm_builder.py",
@@ -367,7 +386,10 @@ def get_step_sequence(include_step6: bool = False, include_audio: bool = True) -
     steps = ["step0", "step1"]
     if include_audio:
         steps.extend(["audio_extract", "audio_profile"])
-    steps.extend(["step2", "step3", "step4", "step5"])
+    steps.append("step2")
+    if include_step6:
+        steps.append("scene_refine")
+    steps.extend(["step3", "step4", "step5"])
     if include_step6:
         steps.append("step6")
     steps.append("step7")

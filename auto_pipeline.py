@@ -179,11 +179,23 @@ class AutoPipeline:
                 config=self.config,
                 config_path=self.config_path
             )
+        elif step_name == "scene_refine":
+            input_j = self.paths.step2_reviewed if self.paths.step2_reviewed.exists() else self.paths.step2_translated
+            command = build_step_command(
+                "scene_refine",
+                input_json=input_j,
+                output_json=self.paths.step2_tone_refined,
+                profile_json=self.paths.step2_profile,
+                config=self.config_path,
+            )
         elif step_name == "step3":
             # branch에 따라 step3 direct_build 여부 결정
             branch_val = self.manifest.data.get("branch_type", "direct_xml")
             direct_build = (branch_val == "direct_xml")
-            input_j = self.paths.step2_reviewed if self.paths.step2_reviewed.exists() else self.paths.step2_translated
+            if self.paths.step2_tone_refined.exists():
+                input_j = self.paths.step2_tone_refined
+            else:
+                input_j = self.paths.step2_reviewed if self.paths.step2_reviewed.exists() else self.paths.step2_translated
             
             command = build_step_command(
                 "step3",
@@ -282,12 +294,15 @@ class AutoPipeline:
             elif tone_method == "string":
                 subsequent_steps.append("audio_profile")
             
-            subsequent_steps.extend(["step2", "review_step2", "step3"])
+            subsequent_steps.extend(["step2", "review_step2"])
+            if self.include_step6:
+                subsequent_steps.append("scene_refine")
+            subsequent_steps.append("step3")
         else:
             subsequent_steps.append("step3")
 
         subsequent_steps.extend(["step4", "step5"])
-        if self.include_step6:
+        if self.include_step6 and branch_type != "scene":
             subsequent_steps.append("step6")
         if self.include_step7:
             subsequent_steps.append("step7")

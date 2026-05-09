@@ -64,8 +64,11 @@ class ConfigManager:
             "use_ja_ref": False,
             "auto_audio_analysis": False,
             "pipeline_mode": "high_quality",
+            "step2_chunk_size": 40,
+            "step2_max_chunk_chars": 3500,
             "orchestrator": {
                 "enabled": False,
+                "mode": "risky_only",
                 "generation_models": [
                     {"provider": "1minai", "model": "gpt-4o-mini", "persona": "Natural: 가장 자연스럽고 구어체적인 한국어 대사체에 집중하세요."},
                     {"provider": "1minai", "model": "claude-3-5-sonnet", "persona": "Faithful: 원문의 의미와 문장 구조를 최대한 유지하며 오역 없는 번역에 집중하세요."}
@@ -315,6 +318,8 @@ class MainApp(QMainWindow):
             self.config_mgr.config["orchestrator"] = {"enabled": True}
         
         self.config_mgr.config["orchestrator"]["enabled"] = (mode == "high_quality")
+        if mode == "high_quality":
+            self.config_mgr.config["orchestrator"]["mode"] = "risky_only"
         self.config_mgr.save()
 
         # 0. 설정 필수 필드 확인

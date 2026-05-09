@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import argparse
+import re
 import signal
 import sys
 from pathlib import Path
@@ -47,6 +48,10 @@ def is_fatal_llm_error(exc) -> bool:
     return any(keyword in err for keyword in FATAL_LLM_ERROR_KEYWORDS)
 
 
+def is_max_tokens_error(exc) -> bool:
+    return "max_tokens" in str(exc).lower()
+
+
 def signal_handler(sig, frame):
     global b_stop_requested
     log.info("중단 신호 수신. 현재 작업을 마무리하고 저장합니다...")
@@ -79,13 +84,55 @@ def generate_text_hash(text: str) -> str:
 def is_only_tags_and_punct(text: str) -> bool:
     """태그와 문장 부호만 있는 경우 제외 (예: <Alias=Name>.)"""
     if not text: return True
-    import re
     # 1. 모든 <...> 형태의 태그 제거
     stripped = re.sub(r"<[^>]+>", "", text)
     # 2. 공백 및 일반적인 문장 부호 제거
     stripped = re.sub(r'[\s.,!?;:"\'-_\[\]()]+', "", stripped)
     # 3. 남은 문자가 없으면 태그/부호만 있는 것으로 간주
     return len(stripped) == 0
+
+
+def extract_preserved_tokens(text: str) -> set[str]:
+    if not text:
+        return set()
+    return set(re.findall(r"<[^>]+>|\{[^}]+\}|\[[^\]]+\]", text))
+
+
+def assess_translation_risks(id_map: dict, translations: dict) -> list[str]:
+    risks = []
+    for bid, item in id_map.items():
+        src = str(item.get("Text", "") or "")
+        dst = str(translations.get(bid, "") or "").strip()
+        if not dst:
+            risks.append(f"{bid}:empty")
+            continue
+        if dst == src:
+            risks.append(f"{bid}:untranslated")
+        missing_tokens = extract_preserved_tokens(src) - extract_preserved_tokens(dst)
+        if missing_tokens:
+            risks.append(f"{bid}:token_loss")
+        if len(src) >= 20 and len(dst) > len(src) * 3.5:
+            risks.append(f"{bid}:too_long")
+    return risks
+
+
+def build_adaptive_chunks(items: list[dict], max_items: int, max_chars: int) -> list[list[dict]]:
+    chunks = []
+    current = []
+    current_chars = 0
+    for item in items:
+        text_len = len(str(item.get("Text", "") or ""))
+        would_exceed_items = len(current) >= max_items
+        would_exceed_chars = current and current_chars + text_len > max_chars
+        if would_exceed_items or would_exceed_chars:
+            chunks.append(current)
+            current = []
+            current_chars = 0
+        current.append(item)
+        current_chars += text_len
+    if current:
+        chunks.append(current)
+    return chunks
 
 # =============================================================================
 # 말투 프로파일링
@@ -208,7 +255,7 @@ def build_scene_prompt(chunk_items, mod_stem, context_lines, scene_profile, glos
 """
     return instructions + "\n\n" + "\n".join(dialogue_blocks), id_map
 
-def translate_scene_recursive(chunk_items, backend, mod_stem, context_lines, scene_profile, glossary_text, rag, tone_profiles, depth=0):
+def translate_scene_recursive(chunk_items, backend, mod_stem, context_lines, scene_profile, glossary_text, rag, tone_profiles, depth=0, orchestration_backend=None, risk_report=None):
     if not chunk_items or depth > 5 or b_stop_requested:
         return
 
@@ -216,19 +263,22 @@ def translate_scene_recursive(chunk_items, backend, mod_stem, context_lines, sce
 
     try:
         from orchestrator import TranslationOrchestrator
-        if isinstance(backend, TranslationOrchestrator):
-            # 오케스트레이터인 경우 문맥 정보를 명시적으로 분리하여 전달
+
+        char_profile_info = ""
+        context_info = ""
+        if isinstance(backend, TranslationOrchestrator) or orchestration_backend:
             char_profile_info = f"씬 분위기: {scene_profile.get('scene_mood', '')}\n"
             for spk, guide in scene_profile.get("character_guidelines", {}).items():
                 char_profile_info += f"- {spk}: {guide}\n"
-                
-            context_info = ""
             for ctx in context_lines:
                 context_info += f"[{ctx.get('Speaker')}] {ctx.get('Text')}\n"
-                
-            raw = backend.translate_with_review(prompt, context_info=context_info, char_profile=char_profile_info)
-        else:
-            raw = backend.generate_content(prompt)
+
+        def generate_with(selected_backend):
+            if isinstance(selected_backend, TranslationOrchestrator):
+                return selected_backend.translate_with_review(prompt, context_info=context_info, char_profile=char_profile_info)
+            return selected_backend.generate_content(prompt)
+
+        raw = generate_with(backend)
         
         res = json_repair.repair_json(raw, return_objects=True)
 
@@ -236,10 +286,25 @@ def translate_scene_recursive(chunk_items, backend, mod_stem, context_lines, sce
             # 모든 요청 ID가 포함되었는지 확인
             missing_ids = [bid for bid in id_map if bid not in res or not str(res[bid]).strip()]
             if missing_ids:
-                if len(chunk_items) > 1:
+                if orchestration_backend:
+                    raise ValueError(f"Risky translation: missing ids {missing_ids}")
+                elif len(chunk_items) > 1:
                     raise ValueError(f"Partial translation detected ({len(missing_ids)}/{len(id_map)} items missing).")
                 else:
                     log.error(f"  [Error] 단일 항목 번역 실패: {chunk_items[0].get('Text')[:30]}...")
+
+            risks = assess_translation_risks(id_map, res)
+            if risks and orchestration_backend:
+                log.info(f"  -> 위험 청크 감지 ({', '.join(risks[:5])}). 오케스트레이션 재번역을 시도합니다.")
+                if risk_report is not None:
+                    risk_report.append({"depth": depth, "size": len(chunk_items), "risks": risks})
+                raw = generate_with(orchestration_backend)
+                res = json_repair.repair_json(raw, return_objects=True)
+                if not isinstance(res, dict):
+                    raise ValueError("Invalid orchestration JSON response (not a dict)")
+                missing_ids = [bid for bid in id_map if bid not in res or not str(res[bid]).strip()]
+                if missing_ids and len(chunk_items) > 1:
+                    raise ValueError(f"Partial orchestration translation detected ({len(missing_ids)}/{len(id_map)} items missing).")
             
             for bid, trans in res.items():
                 if bid in id_map:
@@ -252,10 +317,19 @@ def translate_scene_recursive(chunk_items, backend, mod_stem, context_lines, sce
             log.error(f"치명적 LLM 인증/권한 오류로 번역을 중단합니다: {e}")
             raise
         log.warning(f"Error at depth {depth}: {e}. Splitting chunk...")
+        if orchestration_backend and not is_max_tokens_error(e):
+            try:
+                log.info("  -> fast 번역 실패. 청크 분할 전에 오케스트레이션으로 복구를 시도합니다.")
+                translate_scene_recursive(chunk_items, orchestration_backend, mod_stem, context_lines, scene_profile, glossary_text, rag, tone_profiles, depth, None, risk_report)
+                return
+            except Exception as orch_e:
+                if is_fatal_llm_error(orch_e):
+                    raise
+                log.warning(f"오케스트레이션 복구 실패: {orch_e}")
         if len(chunk_items) > 1:
             mid = len(chunk_items) // 2
-            translate_scene_recursive(chunk_items[:mid], backend, mod_stem, context_lines, scene_profile, glossary_text, rag, tone_profiles, depth + 1)
-            translate_scene_recursive(chunk_items[mid:], backend, mod_stem, chunk_items[:mid], scene_profile, glossary_text, rag, tone_profiles, depth + 1)
+            translate_scene_recursive(chunk_items[:mid], backend, mod_stem, context_lines, scene_profile, glossary_text, rag, tone_profiles, depth + 1, orchestration_backend, risk_report)
+            translate_scene_recursive(chunk_items[mid:], backend, mod_stem, chunk_items[:mid], scene_profile, glossary_text, rag, tone_profiles, depth + 1, orchestration_backend, risk_report)
 
 # =============================================================================
 # 메인 실행부
@@ -302,12 +376,18 @@ def main():
         from orchestrator import TranslationOrchestrator
         
         orch_cfg = config.get("orchestrator", {})
-        if orch_cfg.get("enabled"):
-            log.info("멀티 모델 오케스트레이터 모드 활성화")
+        orch_mode = str(orch_cfg.get("mode", "always" if orch_cfg.get("enabled") else "off")).lower()
+        orchestration_backend = None
+        backend = get_llm_backend(config, "step2_prompt")
+        profile_backend = get_llm_backend(config, "step2_prompt", role="audio_profile")
+
+        if orch_cfg.get("enabled") and orch_mode in ("always", "risky_only"):
+            log.info(f"멀티 모델 오케스트레이터 모드 활성화: {orch_mode}")
             gen_backends = []
             for m in orch_cfg.get("generation_models", []):
                 # 각 모델별 페르소나를 시스템 인스트럭션에 결합
                 m_config = config.copy()
+                m_config["provider"] = m["provider"]
                 m_config["api_provider"] = m["provider"]
                 m_config["model_name"] = m["model"]
                 persona_prompt = f"{config.get('step2_prompt', '')}\n\n[페르소나] {m['persona']}"
@@ -317,13 +397,14 @@ def main():
             
             review_cfg = orch_cfg.get("review_model", {})
             r_config = config.copy()
+            r_config["provider"] = review_cfg["provider"]
             r_config["api_provider"] = review_cfg["provider"]
             r_config["model_name"] = review_cfg["model"]
             review_backend = get_llm_backend(r_config, "step2_prompt")
             
-            backend = TranslationOrchestrator(gen_backends, review_backend, glossary_text=glossary_text, work_dir=out_path.parent) 
-        else:
-            backend = get_llm_backend(config, "step2_prompt")
+            orchestration_backend = TranslationOrchestrator(gen_backends, review_backend, glossary_text=glossary_text, work_dir=out_path.parent)
+            if orch_mode == "always":
+                backend = orchestration_backend
     except Exception as e:
         log.error(f"백엔드 또는 오케스트레이터 초기화 실패: {e}")
         import traceback
@@ -386,7 +467,7 @@ def main():
         if q_id in all_profiles:
             q_profile = all_profiles[q_id]
         else:
-            q_profile = profile_scene(quest, backend, args.use_ja_ref, mod_stem, rag)
+            q_profile = profile_scene(quest, profile_backend, args.use_ja_ref, mod_stem, rag)
             all_profiles[q_id] = q_profile
             with open(profile_path, "w", encoding="utf-8") as f:
                 json.dump(all_profiles, f, ensure_ascii=False, indent=2)
@@ -439,8 +520,11 @@ def main():
                         else:
                             dial_flat_list.append(choice)
 
-        chunks = [dial_flat_list[i : i + 20] for i in range(0, len(dial_flat_list), 20)]
+        chunk_size = int(config.get("step2_chunk_size", config.get("chunk_size", 40)))
+        max_chunk_chars = int(config.get("step2_max_chunk_chars", 3500))
+        chunks = build_adaptive_chunks(dial_flat_list, chunk_size, max_chunk_chars)
         recent_context = []
+        risk_report = []
 
         num_chunks = len(chunks)
         for i, chunk in enumerate(chunks):
@@ -448,7 +532,7 @@ def main():
             log.info(f"  -> [청크 {i+1}/{num_chunks}] {len(chunk)}개 대사 번역 중...")
             
             # 번역 대상이 이미 채워져 있는지 확인 (중복 번역 방지 로직은 필요시 추가)
-            translate_scene_recursive(chunk, backend, mod_stem, recent_context, q_profile, glossary_text, rag, tone_profiles)
+            translate_scene_recursive(chunk, backend, mod_stem, recent_context, q_profile, glossary_text, rag, tone_profiles, orchestration_backend=orchestration_backend, risk_report=risk_report)
             # Keep a short trailing window so adjacent chunks stay coherent
             # without letting prompts grow indefinitely.
             recent_context = chunk[-5:]
@@ -456,6 +540,11 @@ def main():
             # 중간 저장 (실시간 반영은 임시 파일에)
             with open(progress_path, "w", encoding="utf-8") as f:
                 json.dump(scenes_data, f, ensure_ascii=False, indent=2)
+
+        if risk_report:
+            risk_path = out_path.with_suffix(".risk_report.json")
+            with open(risk_path, "w", encoding="utf-8") as f:
+                json.dump(risk_report, f, ensure_ascii=False, indent=2)
 
     if b_stop_requested:
         log.info(f"⚠️ 중지됨. 진행 상황 보존: {progress_path}")
@@ -472,6 +561,8 @@ def main():
         from orchestrator import TranslationOrchestrator
         if isinstance(backend, TranslationOrchestrator):
             backend.cleanup()
+        elif isinstance(orchestration_backend, TranslationOrchestrator):
+            orchestration_backend.cleanup()
 
     # 1min.ai 누적 크레딧 출력
     from llm_backend import Min1AIBackend
