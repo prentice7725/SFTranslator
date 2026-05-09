@@ -33,6 +33,20 @@ CONFIG_FILE = SCRIPT_DIR / "config.json"
 
 b_stop_requested = False
 
+FATAL_LLM_ERROR_KEYWORDS = (
+    "iam_permission_denied",
+    "permission 'aiplatform.endpoints.predict'",
+    "permission denied",
+    "defaultcredentialserror",
+    "google_application_credentials",
+)
+
+
+def is_fatal_llm_error(exc) -> bool:
+    err = str(exc).lower()
+    return any(keyword in err for keyword in FATAL_LLM_ERROR_KEYWORDS)
+
+
 def signal_handler(sig, frame):
     global b_stop_requested
     log.info("중단 신호 수신. 현재 작업을 마무리하고 저장합니다...")
@@ -234,6 +248,9 @@ def translate_scene_recursive(chunk_items, backend, mod_stem, context_lines, sce
             raise ValueError("Invalid JSON response (not a dict)")
 
     except Exception as e:
+        if is_fatal_llm_error(e):
+            log.error(f"치명적 LLM 인증/권한 오류로 번역을 중단합니다: {e}")
+            raise
         log.warning(f"Error at depth {depth}: {e}. Splitting chunk...")
         if len(chunk_items) > 1:
             mid = len(chunk_items) // 2

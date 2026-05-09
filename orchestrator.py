@@ -9,6 +9,20 @@ import json_repair
 
 log = logging.getLogger("Orchestrator")
 
+FATAL_LLM_ERROR_KEYWORDS = (
+    "iam_permission_denied",
+    "permission 'aiplatform.endpoints.predict'",
+    "permission denied",
+    "defaultcredentialserror",
+    "google_application_credentials",
+)
+
+
+def is_fatal_llm_error(exc) -> bool:
+    err = str(exc).lower()
+    return any(keyword in err for keyword in FATAL_LLM_ERROR_KEYWORDS)
+
+
 class TranslationCache:
     """번역 결과물을 로컬 파일에 캐싱하여 중복 요청을 방지합니다."""
     def __init__(self, cache_file="translation_cache.json"):
@@ -107,6 +121,9 @@ class TranslationOrchestrator:
                     if res:
                         candidates.append(res)
                 except Exception as e:
+                    if is_fatal_llm_error(e):
+                        log.error(f"치명적 LLM 인증/권한 오류 발생: {e}")
+                        raise
                     log.error(f"후보 생성 중 오류 발생: {e}")
 
         if not candidates:
@@ -218,4 +235,3 @@ class TranslationOrchestrator:
 어떠한 부가 설명 없이, 오직 완성된 JSON 데이터만 출력하십시오.
 """
         return instructions
-
