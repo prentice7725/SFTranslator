@@ -3,6 +3,7 @@ import sys
 import struct
 import zlib
 import argparse
+import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from dataclasses import dataclass
@@ -296,6 +297,65 @@ def create_strings_files(db: TranslationDB, mod_stem: str, output_dir: Path, lan
         print(" ! No string maps found for localized output.")
 
 
+def _verify_strings_file(path: Path, file_type: str) -> dict:
+    result = {"file": str(path), "row_count": 0, "empty_count": 0, "encoding_errors": 0}
+    raw = path.read_bytes()
+    if len(raw) < 8:
+        result["encoding_errors"] = 1
+        return result
+    count, _data_size = struct.unpack("<II", raw[:8])
+    result["row_count"] = count
+    data_base = 8 + count * 8
+    for idx in range(count):
+        off = 8 + idx * 8
+        if off + 8 > len(raw):
+            result["encoding_errors"] += 1
+            break
+        offset = struct.unpack("<I", raw[off + 4 : off + 8])[0]
+        abs_pos = data_base + offset
+        try:
+            if file_type == "strings":
+                end = raw.find(b"\x00", abs_pos)
+                end = len(raw) if end == -1 else end
+                text = raw[abs_pos:end].decode("utf-8")
+            else:
+                if abs_pos + 4 > len(raw):
+                    result["encoding_errors"] += 1
+                    continue
+                size = struct.unpack("<I", raw[abs_pos : abs_pos + 4])[0]
+                text = raw[abs_pos + 4 : abs_pos + 4 + max(0, size - 1)].decode("utf-8")
+            if text == "":
+                result["empty_count"] += 1
+        except Exception:
+            result["encoding_errors"] += 1
+    return result
+
+
+def write_step7_verify(output_dir: Path, input_esp: Path, dest_esm: Path, lang: str) -> Path:
+    strings_dir = output_dir / "Strings"
+    string_reports = []
+    if strings_dir.exists():
+        for ext in ("strings", "dlstrings", "ilstrings"):
+            path = strings_dir / f"{input_esp.stem}_{lang}.{ext}"
+            if path.exists():
+                string_reports.append(_verify_strings_file(path, ext))
+    report = {
+        "step": "step7_verify",
+        "output_dir": str(output_dir),
+        "esm_exists": dest_esm.exists(),
+        "esm_size": dest_esm.stat().st_size if dest_esm.exists() else 0,
+        "strings": string_reports,
+        "row_count_total": sum(item["row_count"] for item in string_reports),
+        "empty_string_total": sum(item["empty_count"] for item in string_reports),
+        "encoding_error_total": sum(item["encoding_errors"] for item in string_reports),
+        "backup_created": (output_dir / f"{input_esp.name}.bak").exists(),
+        "dry_run_import": dest_esm.exists() and (dest_esm.stat().st_size > 0 if dest_esm.exists() else False),
+    }
+    verify_path = output_dir / f"{input_esp.stem}.step7.verify.json"
+    verify_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return verify_path
+
+
 # =========================================================================
 # Main
 # =========================================================================
@@ -341,6 +401,7 @@ def main():
         import shutil
         dest_esm = output_dir / input_esp.name
         shutil.copyfile(input_esp, dest_esm)
+        shutil.copyfile(input_esp, output_dir / f"{input_esp.name}.bak")
         print(f" ✓ Copied original ESM to {dest_esm.name}")
         
     else:
@@ -351,10 +412,14 @@ def main():
         # 새 ESM 저장
         new_binary = ast.serialize()
         dest_esm = output_dir / input_esp.name
+        import shutil
+        shutil.copyfile(input_esp, output_dir / f"{input_esp.name}.bak")
         with open(dest_esm, "wb") as f:
             f.write(new_binary)
         print(f" ✓ Saved patched ESM to {dest_esm.name}")
 
+    verify_path = write_step7_verify(output_dir, input_esp, dest_esm, args.lang)
+    print(f" ✓ Step7 verify report: {verify_path.name}")
     print(f"\n[OK] Step 7 빌드 완료! 결과물 폴더: {output_dir}")
     print_ok(output_dir)
     return EXIT_SUCCESS

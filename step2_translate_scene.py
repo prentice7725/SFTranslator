@@ -19,6 +19,14 @@ from pipeline_runner import (
     print_ok,
     require_file,
 )
+from prd_contract import (
+    PROMPT_VERSION,
+    TOOL_VERSION,
+    add_item_contract,
+    estimate_tokens,
+    extract_preserved_tokens,
+    risk_flags,
+)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -92,47 +100,54 @@ def is_only_tags_and_punct(text: str) -> bool:
     return len(stripped) == 0
 
 
-def extract_preserved_tokens(text: str) -> set[str]:
-    if not text:
-        return set()
-    return set(re.findall(r"<[^>]+>|\{[^}]+\}|\[[^\]]+\]", text))
-
-
-def assess_translation_risks(id_map: dict, translations: dict) -> list[str]:
+def assess_translation_risks(id_map: dict, translations: dict) -> list[dict]:
     risks = []
     for bid, item in id_map.items():
         src = str(item.get("Text", "") or "")
         dst = str(translations.get(bid, "") or "").strip()
-        if not dst:
-            risks.append(f"{bid}:empty")
-            continue
-        if dst == src:
-            risks.append(f"{bid}:untranslated")
-        missing_tokens = extract_preserved_tokens(src) - extract_preserved_tokens(dst)
-        if missing_tokens:
-            risks.append(f"{bid}:token_loss")
-        if len(src) >= 20 and len(dst) > len(src) * 3.5:
-            risks.append(f"{bid}:too_long")
+        for flag in risk_flags(src, dst, item):
+            risks.append({"batch_id": bid, "stable_id": item.get("stable_id"), **flag})
     return risks
 
 
-def build_adaptive_chunks(items: list[dict], max_items: int, max_chars: int) -> list[list[dict]]:
+def build_adaptive_chunks(items: list[dict], max_items: int, max_chars: int, max_tokens: int) -> list[list[dict]]:
     chunks = []
     current = []
     current_chars = 0
+    current_tokens = 0
     for item in items:
-        text_len = len(str(item.get("Text", "") or ""))
+        text = str(item.get("Text", "") or "")
+        text_len = len(text)
+        token_count = estimate_tokens(text) * 2
         would_exceed_items = len(current) >= max_items
         would_exceed_chars = current and current_chars + text_len > max_chars
-        if would_exceed_items or would_exceed_chars:
+        would_exceed_tokens = current and current_tokens + token_count > max_tokens
+        if would_exceed_items or would_exceed_chars or would_exceed_tokens:
             chunks.append(current)
             current = []
             current_chars = 0
+            current_tokens = 0
         current.append(item)
         current_chars += text_len
+        current_tokens += token_count
     if current:
         chunks.append(current)
     return chunks
+
+
+def build_chunk_log_entry(chunk_id: str, chunk: list[dict], model: str, retry_count: int = 0, split_reason: str = "") -> dict:
+    source_chars = sum(len(str(item.get("Text", "") or "")) for item in chunk)
+    input_tokens = sum(estimate_tokens(str(item.get("Text", "") or "")) for item in chunk)
+    return {
+        "chunk_id": chunk_id,
+        "line_count": len(chunk),
+        "source_chars": source_chars,
+        "estimated_input_tokens": input_tokens,
+        "estimated_output_tokens": input_tokens,
+        "model": model,
+        "retry_count": retry_count,
+        "split_reason": split_reason,
+    }
 
 # =============================================================================
 # 말투 프로파일링
@@ -294,8 +309,10 @@ def translate_scene_recursive(chunk_items, backend, mod_stem, context_lines, sce
                     log.error(f"  [Error] 단일 항목 번역 실패: {chunk_items[0].get('Text')[:30]}...")
 
             risks = assess_translation_risks(id_map, res)
-            if risks and orchestration_backend:
-                log.info(f"  -> 위험 청크 감지 ({', '.join(risks[:5])}). 오케스트레이션 재번역을 시도합니다.")
+            orchestration_risks = [r for r in risks if r.get("severity") in {"fatal", "quality"}]
+            if orchestration_risks and orchestration_backend:
+                risk_codes = [r.get("code", "") for r in orchestration_risks[:5]]
+                log.info(f"  -> 위험 청크 감지 ({', '.join(risk_codes)}). 오케스트레이션 재번역을 시도합니다.")
                 if risk_report is not None:
                     risk_report.append({"depth": depth, "size": len(chunk_items), "risks": risks})
                 raw = generate_with(orchestration_backend)
@@ -309,6 +326,12 @@ def translate_scene_recursive(chunk_items, backend, mod_stem, context_lines, sce
             for bid, trans in res.items():
                 if bid in id_map:
                     id_map[bid]["Translate"] = trans
+                    id_map[bid]["translation"] = trans
+                    id_map[bid]["model"] = getattr(backend, "model_name", backend.__class__.__name__)
+                    id_map[bid].setdefault("chunk_id", "")
+                    id_map[bid]["risk_flags"] = risk_flags(str(id_map[bid].get("Text", "") or ""), str(trans or ""), id_map[bid])
+                    id_map[bid].setdefault("glossary_hits", [])
+                    id_map[bid].setdefault("translation_class", "TRANSLATE")
         else:
             raise ValueError("Invalid JSON response (not a dict)")
 
@@ -488,6 +511,7 @@ def main():
                         elif is_only_tags_and_punct(txt):
                             dial["Translate"] = txt
                         else:
+                            add_item_contract(dial, plugin_name=mod_stem, record_type=dial.get("record_type", "INFO"), subrecord_path=dial.get("subrecord_path", "NAM1"))
                             dial_flat_list.append(dial)
                     for choice in dial.get("PlayerChoices", []):
                         ctxt = choice.get("Text")
@@ -497,6 +521,7 @@ def main():
                             elif is_only_tags_and_punct(ctxt):
                                 choice["Translate"] = ctxt
                             else:
+                                add_item_contract(choice, plugin_name=mod_stem, record_type=choice.get("record_type", "INFO"), subrecord_path=choice.get("subrecord_path", "CHOICE"))
                                 dial_flat_list.append(choice)
         
         # StandaloneDials 평탄화
@@ -509,6 +534,7 @@ def main():
                     elif is_only_tags_and_punct(txt):
                         d["Translate"] = txt
                     else:
+                        add_item_contract(d, plugin_name=mod_stem, record_type=d.get("record_type", "INFO"), subrecord_path=d.get("subrecord_path", "NAM1"))
                         dial_flat_list.append(d)
                 for choice in d.get("PlayerChoices", []):
                     ctxt = choice.get("Text")
@@ -518,17 +544,25 @@ def main():
                         elif is_only_tags_and_punct(ctxt):
                             choice["Translate"] = ctxt
                         else:
+                            add_item_contract(choice, plugin_name=mod_stem, record_type=choice.get("record_type", "INFO"), subrecord_path=choice.get("subrecord_path", "CHOICE"))
                             dial_flat_list.append(choice)
 
         chunk_size = int(config.get("step2_chunk_size", config.get("chunk_size", 40)))
         max_chunk_chars = int(config.get("step2_max_chunk_chars", 3500))
-        chunks = build_adaptive_chunks(dial_flat_list, chunk_size, max_chunk_chars)
+        max_input_tokens = int(config.get("step2_max_input_tokens", 6000))
+        max_output_tokens = int(config.get("step2_max_output_tokens", 4000))
+        chunks = build_adaptive_chunks(dial_flat_list, chunk_size, max_chunk_chars, max_input_tokens + max_output_tokens)
         recent_context = []
         risk_report = []
+        chunk_log = []
 
         num_chunks = len(chunks)
         for i, chunk in enumerate(chunks):
             if b_stop_requested: break
+            chunk_id = f"{q_id}_chunk_{i + 1:03d}"
+            for item in chunk:
+                item["chunk_id"] = chunk_id
+            chunk_log.append(build_chunk_log_entry(chunk_id, chunk, str(config.get("model_name") or config.get("models", {}).get("translation", "fast_translation"))))
             log.info(f"  -> [청크 {i+1}/{num_chunks}] {len(chunk)}개 대사 번역 중...")
             
             # 번역 대상이 이미 채워져 있는지 확인 (중복 번역 방지 로직은 필요시 추가)
@@ -545,6 +579,19 @@ def main():
             risk_path = out_path.with_suffix(".risk_report.json")
             with open(risk_path, "w", encoding="utf-8") as f:
                 json.dump(risk_report, f, ensure_ascii=False, indent=2)
+        if chunk_log:
+            chunk_log_path = out_path.with_suffix(".chunk_log.json")
+            with open(chunk_log_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "prompt_version": PROMPT_VERSION,
+                        "tool_version": TOOL_VERSION,
+                        "chunks": chunk_log,
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
 
     if b_stop_requested:
         log.info(f"⚠️ 중지됨. 진행 상황 보존: {progress_path}")

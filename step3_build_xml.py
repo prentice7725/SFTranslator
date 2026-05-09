@@ -16,6 +16,15 @@ from pipeline_runner import (
     print_ok,
     require_file,
 )
+from prd_contract import (
+    COPY_AS_IS,
+    LOCKED_TERM,
+    SKIP_INTERNAL,
+    classify_translation,
+    context_id,
+    make_stable_id,
+    source_hash,
+)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -30,7 +39,7 @@ def generate_text_hash(text: str) -> str:
 
 
 def load_translation_map(trans_path: str) -> dict:
-    """JSON 번역 파일을 로드하여 {key: translated_text} 딕셔너리로 반환."""
+    """JSON 번역 파일을 로드하여 {key: translation metadata} 딕셔너리로 반환."""
     translated_map = {}
     if not os.path.exists(trans_path):
         print(f"WARNING: Translation file not found: {trans_path}.")
@@ -41,7 +50,7 @@ def load_translation_map(trans_path: str) -> dict:
 
     # 평탄화된 과거 버전 (플랫 구조: {hash: translated_text}) 지원용
     if isinstance(raw_data, dict) and all(isinstance(v, str) for v in raw_data.values()):
-        return raw_data
+        return {k: {"translation": v, "legacy": True} for k, v in raw_data.items()}
 
     # 새로운 구조 (QuestID -> Scenes -> Dials -> Dialogues 등 배열 기반) 지원
     def _add_translation(item):
@@ -51,19 +60,30 @@ def load_translation_map(trans_path: str) -> dict:
         if not trans_text:
             # If "Translate" is not found, it might simply not be translated.
             return
-            
+        entry = {
+            "translation": trans_text,
+            "source": txt,
+            "stable_id": item.get("stable_id"),
+            "source_hash": item.get("source_hash") or source_hash(txt),
+            "context_id": item.get("context_id"),
+            "translation_class": item.get("translation_class", "TRANSLATE"),
+        }
+
+        if item.get("stable_id"):
+            translated_map[item["stable_id"]] = entry
+
         h_id = generate_text_hash(txt) if txt else "000000"
-        translated_map[h_id] = trans_text
+        translated_map.setdefault(h_id, {**entry, "legacy": True})
 
         s_id = item.get("StringID", "")
         if s_id and s_id != "000000":
-            translated_map[s_id] = trans_text
+            translated_map.setdefault(s_id, {**entry, "legacy": True})
             try:
-                translated_map[f"{int(s_id, 16):06X}"] = trans_text
+                translated_map.setdefault(f"{int(s_id, 16):06X}", {**entry, "legacy": True})
             except ValueError:
                 pass
         if txt:
-            translated_map[txt] = trans_text
+            translated_map.setdefault(txt, {**entry, "legacy": True})
 
     def _extract_translations_from_dialogues(dialogues):
         for item in dialogues:
@@ -101,6 +121,12 @@ def load_translation_map(trans_path: str) -> dict:
     return translated_map
 
 
+def _translation_text(value) -> str | None:
+    if isinstance(value, dict):
+        return value.get("translation")
+    return value
+
+
 def merge_json_into_xml(xml_path: str, translated_map: dict, output_xml: str):
     """
     기존 완성된 XML 파일을 읽어, JSON 번역 맵 기준으로 <Dest> 값만 업데이트합니다.
@@ -128,9 +154,14 @@ def merge_json_into_xml(xml_path: str, translated_map: dict, output_xml: str):
     strings = content.findall("String")
     total = len(strings)
     match_count = 0
+    skipped_count = 0
+    errors = []
 
     for s_node in strings:
         sID = s_node.get("sID", "")            # <String sID="XXXXXX">
+        stable_id = s_node.get("stable_id", "")
+        expected_source_hash = s_node.get("source_hash", "")
+        translation_class = s_node.get("translation_class", "TRANSLATE")
         source_node = s_node.find("Source")
         dest_node   = s_node.find("Dest")
 
@@ -138,33 +169,60 @@ def merge_json_into_xml(xml_path: str, translated_map: dict, output_xml: str):
             continue
 
         source_text = source_node.text if source_node is not None else ""
-        trans = None
+        actual_source_hash = source_hash(source_text)
+        trans_entry = None
 
-        # 1순위: sID가 있으면 hex 키로 lookup
-        if sID:
-            trans = translated_map.get(sID)
-            if trans is None:
-                # 대소문자 정규화 시도
-                trans = translated_map.get(sID.upper())
+        if translation_class in {COPY_AS_IS, SKIP_INTERNAL, LOCKED_TERM}:
+            skipped_count += 1
+            continue
 
-        # 2순위: Source 텍스트 해시로 lookup
-        if trans is None and source_text:
+        if expected_source_hash and expected_source_hash != actual_source_hash:
+            errors.append({"stable_id": stable_id, "code": "source_hash_mismatch", "expected": expected_source_hash, "actual": actual_source_hash})
+            continue
+
+        # 1순위: stable_id
+        if stable_id:
+            trans_entry = translated_map.get(stable_id)
+
+        # 2순위: sID가 있으면 hex 키로 lookup (legacy fallback)
+        if trans_entry is None and sID:
+            trans_entry = translated_map.get(sID) or translated_map.get(sID.upper())
+
+        # 3순위: Source 텍스트 해시로 lookup (legacy fallback)
+        if trans_entry is None and source_text:
             key_hash = generate_text_hash(source_text)
-            trans = translated_map.get(key_hash)
+            trans_entry = translated_map.get(key_hash)
 
-        # 3순위: Source 텍스트 직접 비교 (fallback)
-        if trans is None and source_text:
-            trans = translated_map.get(source_text)
+        # 4순위: Source 텍스트 직접 비교 (legacy fallback)
+        if trans_entry is None and source_text:
+            trans_entry = translated_map.get(source_text)
 
+        trans = _translation_text(trans_entry)
         if trans is not None:
+            if isinstance(trans_entry, dict) and trans_entry.get("source_hash") and trans_entry["source_hash"] != actual_source_hash:
+                errors.append({"stable_id": stable_id, "code": "translation_source_hash_mismatch"})
+                continue
             dest_node.text = sanitize_xml_chars(trans)
             match_count += 1
 
     print(f"Merged {match_count}/{total} strings from translation dictionary into XML.")
+    report_path = os.path.splitext(output_xml)[0] + ".merge_report.json"
+    report = {
+        "total_nodes": total,
+        "merged": match_count,
+        "intentionally_skipped": skipped_count,
+        "errors": errors,
+    }
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    if errors:
+        print(f"ERROR: merge validation failed. See {report_path}", file=sys.stderr)
+        return False
 
     # 다시 예쁘게 저장
     _write_xml_from_element(root, output_xml)
     print(f"Saved merged XML to {output_xml}")
+    return True
 
 
 def _write_xml_from_element(root: ET.Element, output_path: str):
@@ -265,7 +323,8 @@ def main():
         translated_map = load_translation_map(trans_path)
         print(f" → {len(translated_map)} translation entries loaded.")
 
-        merge_json_into_xml(xml_path, translated_map, output_xml)
+        if not merge_json_into_xml(xml_path, translated_map, output_xml):
+            return EXIT_OUTPUT_FAILURE
         print("Done!")
         print_ok(output_xml)
         return EXIT_SUCCESS
@@ -321,16 +380,27 @@ def main():
 
         if entry.string_id > 0:
             key_hex = f"{entry.string_id:06X}"
-            trans = translated_map.get(key_hex)
+            trans = _translation_text(translated_map.get(key_hex))
 
         if trans is None and entry.source_text:
             key_hash = generate_text_hash(entry.source_text)
-            trans = translated_map.get(key_hash)
+            stable_id = make_stable_id(
+                os.path.splitext(os.path.basename(input_path))[0],
+                f"{entry.form_id:08X}",
+                entry.rec_type,
+                entry.field_type,
+                entry.field_index,
+                entry.source_text,
+            )
+            trans = _translation_text(translated_map.get(stable_id))
+            if trans is None:
+                trans = _translation_text(translated_map.get(key_hash))
 
         if trans is None and entry.source_text:
-            trans = translated_map.get(entry.source_text)
+            trans = _translation_text(translated_map.get(entry.source_text))
 
-        if trans is not None:
+        t_class = classify_translation(entry.source_text, entry.rec_type, entry.field_type)
+        if t_class not in {COPY_AS_IS, SKIP_INTERNAL, LOCKED_TERM} and trans is not None:
             entry.dest_text = trans
             match_count += 1
 

@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from prd_contract import PROMPT_VERSION, TOOL_VERSION, sha256_file, stable_json_hash
 
 EXIT_SUCCESS = 0
 EXIT_ARGUMENT_ERROR = 2
@@ -36,6 +38,7 @@ class PipelinePaths:
     step5_scan: Path
     step6_refined: Path
     step7_output_dir: Path
+    step7_verify: Path
     final_xml: Path
     manifest: Path
 
@@ -61,7 +64,7 @@ STEP_SPECS: dict[str, StepSpec] = {
     "step4": StepSpec("step4", "step4_translate_xml.py", ("step3_merged",), ("step4_translated",)),
     "step5": StepSpec("step5", "step5_review_xml.py", ("step4_translated",), ("step5_reviewed", "step5_scan")),
     "step6": StepSpec("step6", "step6_mod_update.py", ("step5_reviewed",), ("step6_refined",), optional=True),
-    "step7": StepSpec("step7", "step7_esm_builder.py", ("final_xml",), ("step7_output_dir",), optional=True),
+    "step7": StepSpec("step7", "step7_esm_builder.py", ("final_xml",), ("step7_output_dir", "step7_verify"), optional=True),
 }
 
 
@@ -91,6 +94,7 @@ def build_job_paths(input_esp: str | Path, work_dir: str | Path | None = None) -
         step5_scan=job_dir / f"{stem}.step5.scan.json",
         step6_refined=job_dir / f"{stem}.step6.refined.xml",
         step7_output_dir=job_dir / f"{stem}_Translated",
+        step7_verify=job_dir / f"{stem}_Translated" / f"{stem}.step7.verify.json",
         final_xml=job_dir / f"{stem}.final.xml",
         manifest=job_dir / f"{stem}.pipeline_manifest.json",
     )
@@ -158,6 +162,8 @@ def build_step_command(step_name: str, config: dict | None = None, **kwargs: Any
             parts.extend(["--from-step", kwargs["from_step"]])
         if kwargs.get("work_dir"):
             parts.extend(["--work-dir", kwargs["work_dir"]])
+        if kwargs.get("dry_run"):
+            parts.append("--dry-run")
         return _stringify_command(parts)
 
     if normalized == "step0":
@@ -403,6 +409,9 @@ class PipelineManifest:
         self.data = {
             "job_id": job_id,
             "updated_at": None,
+            "prompt_version": PROMPT_VERSION,
+            "tool_version": TOOL_VERSION,
+            "artifact_hashes": {},
             "steps": {},
         }
         if self.path.exists():
@@ -432,6 +441,27 @@ class PipelineManifest:
         step_info = self.data.setdefault("steps", {}).setdefault(step_name, {})
         step_info.update(fields)
         self._save()
+
+    def update_integrity(self, *, input_file: str | Path | None = None, config: dict | None = None, config_path: str | Path | None = None) -> None:
+        if input_file and Path(input_file).exists():
+            self.data["input_file_hash"] = sha256_file(input_file)
+        if config is not None:
+            self.data["config_hash"] = stable_json_hash(config)
+            models = config.get("models", {}) if isinstance(config, dict) else {}
+            self.data["model_translation"] = models.get("translation") or config.get("model_name")
+            self.data["model_review"] = models.get("review")
+        elif config_path and Path(config_path).exists():
+            with open(config_path, "rb") as handle:
+                self.data["config_hash"] = hashlib.sha256(handle.read()).hexdigest()
+        self.data["prompt_version"] = PROMPT_VERSION
+        self.data["tool_version"] = TOOL_VERSION
+        self._save()
+
+    def update_artifact_hash(self, name: str, path: str | Path) -> None:
+        resolved = Path(path)
+        if resolved.is_file():
+            self.data.setdefault("artifact_hashes", {})[name] = sha256_file(resolved)
+            self._save()
 
 
 def run_subprocess(command: list[str], cwd: str | Path | None = None) -> int:

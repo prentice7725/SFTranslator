@@ -27,6 +27,7 @@ from pipeline_runner import (
     print_ok,
     require_file,
 )
+from prd_contract import classify_translation, context_id, make_stable_id, source_hash
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -637,6 +638,7 @@ def write_xml(entries: List[StringEntry], output_path: str, addon_name: str):
     SSTXMLRessources 형식의 XML 문서를 생성하고 디스크에 기록합니다.
     """
     root = ET.Element("SSTXMLRessources")
+    plugin_stem = os.path.splitext(addon_name)[0]
     params = ET.SubElement(root, "Params")
     ET.SubElement(params, "Addon").text = addon_name
     ET.SubElement(params, "Source").text = "en"
@@ -647,6 +649,18 @@ def write_xml(entries: List[StringEntry], output_path: str, addon_name: str):
     for entry in entries:
         s_node = ET.SubElement(content, "String")
         s_node.set("List", entry.list_id)
+        sid = make_stable_id(
+            plugin_stem,
+            f"{entry.form_id:08X}",
+            entry.rec_type,
+            entry.field_type,
+            entry.field_index,
+            entry.source_text,
+        )
+        s_node.set("stable_id", sid)
+        s_node.set("source_hash", source_hash(entry.source_text))
+        s_node.set("context_id", context_id(f"{entry.form_id:08X}", entry.rec_type, entry.field_type, entry.field_index))
+        s_node.set("translation_class", classify_translation(entry.source_text, entry.rec_type, entry.field_type))
         if entry.string_id > 0:
             s_node.set("sID", f'{entry.string_id:06X}')
         edid_text = entry.edid if entry.edid else f"[{entry.form_id:08X}]"

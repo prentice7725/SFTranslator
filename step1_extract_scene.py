@@ -16,6 +16,7 @@ from pipeline_runner import (
     print_ok,
     require_file,
 )
+from prd_contract import add_item_contract
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -1089,13 +1090,25 @@ class StarfieldSceneExtractor:
                     else:
                         audio_speaker = speaker_name.replace(" ", "").lower()
 
-                    for txt in texts_data:
+                    for line_order, txt in enumerate(texts_data):
                         dialogue_entry = {
                             "FormID": f"{info['FormID']:08X}",
                             "StringID": f"{txt['StringID']:08X}" if txt.get('StringID') else "00000000",
                             "Speaker": speaker_name,
                             "Text": txt.get("Text", "")
                         }
+                        add_item_contract(
+                            dialogue_entry,
+                            plugin_name=self.mod_stem,
+                            record_type="INFO",
+                            subrecord_path="NAM1",
+                            field_index=line_order,
+                            quest_id=f"{dial_dict.get('quest') or 0:08X}",
+                            scene_id=f"{scen_id:08X}",
+                            topic_id=f"{dial_fid:08X}",
+                            topic_info_id=f"{info['FormID']:08X}",
+                            line_order=line_order,
+                        )
                         target_audio_id = txt.get("AudioID") or info.get("AudioID")
                         if target_audio_id:
                             prefix = target_audio_id >> 24
@@ -1177,13 +1190,24 @@ class StarfieldSceneExtractor:
                 else:
                     audio_speaker = speaker_name.replace(" ", "").lower()
 
-                for txt in texts_data:
+                for line_order, txt in enumerate(texts_data):
                     dialogue_entry = {
                         "FormID": f"{info['FormID']:08X}",
                         "StringID": f"{txt['StringID']:08X}" if txt.get('StringID') else "00000000",
                         "Speaker": speaker_name,
                         "Text": txt.get("Text", "")
                     }
+                    add_item_contract(
+                        dialogue_entry,
+                        plugin_name=self.mod_stem,
+                        record_type="INFO",
+                        subrecord_path="NAM1",
+                        field_index=line_order,
+                        quest_id=f"{quest_id or 0:08X}",
+                        topic_id=f"{dial_id:08X}",
+                        topic_info_id=f"{info['FormID']:08X}",
+                        line_order=line_order,
+                    )
                     
                     target_audio_id = txt.get("AudioID") or info.get("AudioID")
                     if target_audio_id:

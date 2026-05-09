@@ -26,6 +26,7 @@ from pipeline_runner import (
     require_file,
     run_subprocess,
 )
+from prd_contract import env_overlay, estimate_tokens, stable_json_hash
 
 
 class PipelineStage(Enum):
@@ -73,10 +74,10 @@ def detect_branch(step1_dump_json: Path) -> str:
     return "direct_xml"
 
 class AutoPipeline:
-    def __init__(self, input_esp: str, config_path: str, from_step: str = "step0", include_step6: bool = False, include_step7: bool = False, resume: bool = False, work_dir: str | None = None, branch: str | None = None, tone_method: str | None = None, skip_review_step2: bool = False):
+    def __init__(self, input_esp: str, config_path: str, from_step: str = "step0", include_step6: bool = False, include_step7: bool = False, resume: bool = False, work_dir: str | None = None, branch: str | None = None, tone_method: str | None = None, skip_review_step2: bool = False, dry_run: bool = False):
         self.paths = build_job_paths(input_esp, work_dir)
         self.config_path = Path(config_path).expanduser().resolve()
-        self.config = load_config(self.config_path)
+        self.config = env_overlay(load_config(self.config_path))
         self.from_step = from_step
         self.include_step6 = include_step6
         self.include_step7 = include_step7
@@ -84,8 +85,62 @@ class AutoPipeline:
         self.branch_override = branch
         self.tone_method_override = tone_method
         self.skip_review_step2 = skip_review_step2
+        self.dry_run = dry_run
         job_id = f"{self.paths.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.manifest = PipelineManifest(self.paths.manifest, job_id=job_id)
+        self.manifest.update_integrity(input_file=self.paths.input_esp, config=self.config)
+
+    def _preflight(self) -> list[str]:
+        errors = []
+        if not self.paths.input_esp.exists():
+            errors.append(f"input file missing: {self.paths.input_esp}")
+        if not self.config_path.exists():
+            errors.append(f"config file missing: {self.config_path}")
+        provider = str(self.config.get("provider") or self.config.get("api_provider") or "").lower()
+        if provider in {"vertexai", "gcp", "google"}:
+            key_path = self.config.get("gcp_key_json") or self.config.get("GOOGLE_APPLICATION_CREDENTIALS")
+            if key_path and not Path(key_path).expanduser().exists():
+                errors.append(f"GCP credential file missing: {key_path}")
+            if not self.config.get("gcp_project_id"):
+                errors.append("gcp_project_id missing")
+            if not self.config.get("gcp_location"):
+                errors.append("gcp_location missing")
+        if provider == "gemini" and not self.config.get("gemini_api_key") and not os.getenv("GEMINI_API_KEY"):
+            errors.append("GEMINI_API_KEY missing")
+        if provider == "openai" and not self.config.get("openai_api_key") and not os.getenv("OPENAI_API_KEY"):
+            errors.append("OPENAI_API_KEY missing")
+        return errors
+
+    def _dry_run_report(self) -> dict:
+        step1_items = []
+        if self.paths.step1_dump.exists():
+            try:
+                data = json.loads(self.paths.step1_dump.read_text(encoding="utf-8"))
+                for quest in data if isinstance(data, list) else data.get("Quests", []):
+                    for scene in quest.get("Scenes", []):
+                        for dial in scene.get("Dials", []):
+                            step1_items.extend(dial.get("Dialogues", []))
+                    for dial in quest.get("StandaloneDials", []):
+                        step1_items.extend(dial.get("Dialogues", []))
+            except Exception:
+                step1_items = []
+        total_chars = sum(len(str(item.get("Text", "") or "")) for item in step1_items)
+        max_items = int(self.config.get("step2_chunk_size", 40))
+        max_chars = int(self.config.get("step2_max_chunk_chars", 3500))
+        estimated_chunks = 0 if not step1_items else max(1, (len(step1_items) + max_items - 1) // max_items, (total_chars + max_chars - 1) // max_chars)
+        input_tokens = sum(estimate_tokens(str(item.get("Text", "") or "")) for item in step1_items)
+        return {
+            "input": str(self.paths.input_esp),
+            "config_hash": stable_json_hash(self.config),
+            "extractable_scene_strings": len(step1_items),
+            "scene_mode": detect_branch(self.paths.step1_dump) == "scene" if self.paths.step1_dump.exists() else None,
+            "estimated_chunks": estimated_chunks,
+            "estimated_input_tokens": input_tokens,
+            "estimated_output_tokens": input_tokens,
+            "audio_analysis_targets": 0,
+            "forbidden_term_candidates": 0,
+            "risk_candidates": 0,
+        }
 
     def _step_output_exists(self, step_name: str) -> bool:
         spec = STEP_SPECS[step_name]
@@ -246,6 +301,9 @@ class AutoPipeline:
         return_code = run_subprocess(command)
         if return_code == 0:
             self.manifest.update_step(step_name, status="done")
+            for output_name in STEP_SPECS[step_name].outputs:
+                output_path = getattr(self.paths, output_name)
+                self.manifest.update_artifact_hash(Path(output_path).name, output_path)
         else:
             self.manifest.update_step(step_name, status="failed", return_code=return_code)
         return return_code
@@ -253,6 +311,20 @@ class AutoPipeline:
     def execute(self) -> int:
         require_file(self.paths.input_esp, "input ESM")
         self.paths.work_dir.mkdir(parents=True, exist_ok=True)
+        preflight_errors = self._preflight()
+        if preflight_errors:
+            self.manifest.update_step("preflight", status="failed", errors=preflight_errors)
+            for error in preflight_errors:
+                print(f"[PREFLIGHT ERROR] {error}", file=sys.stderr)
+            return EXIT_ARGUMENT_ERROR
+        self.manifest.update_step("preflight", status="done")
+        if self.dry_run or self.config.get("dry_run"):
+            report = self._dry_run_report()
+            report_path = self.paths.work_dir / f"{self.paths.stem}.dry_run.json"
+            report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            print_ok(report_path)
+            return EXIT_SUCCESS
 
         # 1) 기초 단계 (step0, step1)
         base_steps = ["step0", "step1"]
@@ -366,6 +438,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--branch", choices=["scene", "direct_xml"], help="Branch type override (scene | direct_xml)")
     parser.add_argument("--tone-method", choices=["audio", "string"], help="Tone profile method override (audio | string)")
     parser.add_argument("--skip-review-step2", action="store_true", help="Skip the JSON review step for speed")
+    parser.add_argument("--dry-run", action="store_true", help="Report expected work without LLM calls")
     args = parser.parse_args()
     args.input_esp = args.input_esp or args.legacy_input
     if args.legacy_step is not None:
@@ -400,7 +473,8 @@ def main() -> int:
             work_dir=args.work_dir,
             branch=args.branch,
             tone_method=args.tone_method,
-            skip_review_step2=args.skip_review_step2
+            skip_review_step2=args.skip_review_step2,
+            dry_run=args.dry_run,
         )
         return pipeline.execute()
     except FileNotFoundError as exc:
