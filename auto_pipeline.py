@@ -1,0 +1,489 @@
+import argparse
+import json
+import shutil
+import platform
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+from enum import Enum
+import sys
+from datetime import datetime
+from pathlib import Path
+
+from pipeline_runner import (
+    EXIT_ARGUMENT_ERROR,
+    EXIT_INPUT_MISSING,
+    EXIT_INTERNAL_ERROR,
+    EXIT_SUCCESS,
+    PipelineManifest,
+    STEP_SPECS,
+    build_job_paths,
+    build_step_command,
+    get_step_sequence,
+    load_config,
+    print_ok,
+    require_file,
+    run_subprocess,
+)
+from prd_contract import env_overlay, estimate_tokens, stable_json_hash
+
+
+class PipelineStage(Enum):
+    INIT = "init"
+    STEP1 = "step1"
+    BRANCH_DETECT = "branch_detect"
+    SELECT_TONE_METHOD = "select_tone_method"
+    AUDIO_EXTRACT = "audio_extract"
+    TONE_PROFILE = "tone_profile"
+    STEP2 = "step2"
+    REVIEW_STEP2 = "review_step2"
+    STEP3 = "step3"
+    STEP4 = "step4"
+    REVIEW_XML = "review_xml"
+    DONE = "done"
+
+def detect_branch(step1_dump_json: Path) -> str:
+    """
+    Returns:
+        "scene"      - dialogue/quest 있음 -> scene 번역 경로
+        "direct_xml" - 내용 없음 -> XML 직행 경로
+
+    step1 dump JSON 구조:
+        리스트 형태 [{ "QuestID": ..., "Scenes": [...], "StandaloneDials": [...] }, ...]
+        각 배치에 Scenes 또는 StandaloneDials에 항목이 하나라도 있으면 scene 분기로 판정
+    """
+    if not step1_dump_json.exists():
+        return "direct_xml"
+    
+    try:
+        data = json.loads(step1_dump_json.read_text(encoding="utf-8"))
+        # dump JSON은 배치 리스트 형태: [{"Scenes": [...], "StandaloneDials": [...], ...}, ...]
+        if isinstance(data, list):
+            for batch in data:
+                if batch.get("Scenes") and len(batch["Scenes"]) > 0:
+                    return "scene"
+                if batch.get("StandaloneDials") and len(batch["StandaloneDials"]) > 0:
+                    return "scene"
+        elif isinstance(data, dict):
+            # 혹시 dict 형태일 경우 대소문자 모두 처리
+            if data.get("scenes") or data.get("Scenes"):
+                return "scene"
+    except Exception:
+        pass
+    return "direct_xml"
+
+class AutoPipeline:
+    def __init__(self, input_esp: str, config_path: str, from_step: str = "step0", include_step6: bool = False, include_step7: bool = False, resume: bool = False, work_dir: str | None = None, branch: str | None = None, tone_method: str | None = None, skip_review_step2: bool = False, dry_run: bool = False):
+        self.paths = build_job_paths(input_esp, work_dir)
+        self.config_path = Path(config_path).expanduser().resolve()
+        self.config = env_overlay(load_config(self.config_path))
+        self.from_step = from_step
+        self.include_step6 = include_step6
+        self.include_step7 = include_step7
+        self.resume = resume
+        self.branch_override = branch
+        self.tone_method_override = tone_method
+        self.skip_review_step2 = skip_review_step2
+        self.dry_run = dry_run
+        job_id = f"{self.paths.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.manifest = PipelineManifest(self.paths.manifest, job_id=job_id)
+        self.manifest.update_integrity(input_file=self.paths.input_esp, config=self.config)
+
+    def _preflight(self) -> list[str]:
+        errors = []
+        if not self.paths.input_esp.exists():
+            errors.append(f"input file missing: {self.paths.input_esp}")
+        if not self.config_path.exists():
+            errors.append(f"config file missing: {self.config_path}")
+        provider = str(self.config.get("provider") or self.config.get("api_provider") or "").lower()
+        if provider in {"vertexai", "gcp", "google"}:
+            key_path = self.config.get("gcp_key_json") or self.config.get("GOOGLE_APPLICATION_CREDENTIALS")
+            if key_path and not Path(key_path).expanduser().exists():
+                errors.append(f"GCP credential file missing: {key_path}")
+            if not self.config.get("gcp_project_id"):
+                errors.append("gcp_project_id missing")
+            if not self.config.get("gcp_location"):
+                errors.append("gcp_location missing")
+        if provider == "gemini" and not self.config.get("gemini_api_key") and not os.getenv("GEMINI_API_KEY"):
+            errors.append("GEMINI_API_KEY missing")
+        if provider == "openai" and not self.config.get("openai_api_key") and not os.getenv("OPENAI_API_KEY"):
+            errors.append("OPENAI_API_KEY missing")
+        return errors
+
+    def _dry_run_report(self) -> dict:
+        step1_items = []
+        if self.paths.step1_dump.exists():
+            try:
+                data = json.loads(self.paths.step1_dump.read_text(encoding="utf-8"))
+                for quest in data if isinstance(data, list) else data.get("Quests", []):
+                    for scene in quest.get("Scenes", []):
+                        for dial in scene.get("Dials", []):
+                            step1_items.extend(dial.get("Dialogues", []))
+                    for dial in quest.get("StandaloneDials", []):
+                        step1_items.extend(dial.get("Dialogues", []))
+            except Exception:
+                step1_items = []
+        total_chars = sum(len(str(item.get("Text", "") or "")) for item in step1_items)
+        max_items = int(self.config.get("step2_chunk_size", 40))
+        max_chars = int(self.config.get("step2_max_chunk_chars", 3500))
+        estimated_chunks = 0 if not step1_items else max(1, (len(step1_items) + max_items - 1) // max_items, (total_chars + max_chars - 1) // max_chars)
+        input_tokens = sum(estimate_tokens(str(item.get("Text", "") or "")) for item in step1_items)
+        return {
+            "input": str(self.paths.input_esp),
+            "config_hash": stable_json_hash(self.config),
+            "extractable_scene_strings": len(step1_items),
+            "scene_mode": detect_branch(self.paths.step1_dump) == "scene" if self.paths.step1_dump.exists() else None,
+            "estimated_chunks": estimated_chunks,
+            "estimated_input_tokens": input_tokens,
+            "estimated_output_tokens": input_tokens,
+            "audio_analysis_targets": 0,
+            "forbidden_term_candidates": 0,
+            "risk_candidates": 0,
+        }
+
+    def _step_output_exists(self, step_name: str) -> bool:
+        spec = STEP_SPECS[step_name]
+        for output_name in spec.outputs:
+            output_path = getattr(self.paths, output_name)
+            if not Path(output_path).exists():
+                return False
+        return True
+
+    def _should_skip(self, step_name: str) -> bool:
+        if not self.resume:
+            return False
+        # Resume only skips a step if the expected outputs exist on disk.
+        # We also acknowledge the manifest "done" status, but file existence
+        # is the most reliable source of truth for potential recovery.
+        return self._step_output_exists(step_name)
+
+    def _copy_final_output(self) -> None:
+        # The pipeline always publishes one stable "final" file even though
+        # the last concrete producer may be Step 5 or Step 6.
+        source = self.paths.step6_refined if self.include_step6 and self.paths.step6_refined.exists() else self.paths.step5_reviewed
+        if not source.exists():
+            return
+        self.paths.final_xml.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, self.paths.final_xml)
+
+    def _run_step(self, step_name: str) -> int:
+        if step_name == "audio_extract":
+            if not self.config.get("auto_audio_analysis", True):
+                self.manifest.update_step(step_name, status="skipped", reason="auto_audio_analysis disabled")
+                print(f"[SKIP] {step_name}: auto_audio_analysis disabled")
+                return EXIT_SUCCESS
+            data_dir = self.config.get("game_data_dir")
+            if not data_dir:
+                self.manifest.update_step(step_name, status="skipped", reason="game_data_dir missing in config")
+                print(f"[SKIP] {step_name}: game_data_dir missing in config")
+                return EXIT_SUCCESS
+            command = build_step_command(
+                step_name,
+                priority_list=self.paths.step1_priority,
+                data_dir=data_dir,
+                output_dir=self.paths.step3_audio_dir,
+            )
+        elif step_name == "audio_profile":
+            if not self.config.get("auto_audio_analysis", True):
+                self.manifest.update_step(step_name, status="skipped", reason="auto_audio_analysis disabled")
+                print(f"[SKIP] {step_name}: auto_audio_analysis disabled")
+                return EXIT_SUCCESS
+            command = build_step_command(
+                step_name,
+                config=self.config,
+                config_path=self.config_path,
+                priority_list=self.paths.step1_priority,
+                audition_dir=self.paths.step3_audio_dir,
+                output=self.paths.audio_tone_profile,
+            )
+        elif step_name == "step0":
+            command = build_step_command(step_name, input_esp=self.paths.input_esp, output_xml=self.paths.step0_xml)
+        elif step_name == "step1":
+            command = build_step_command(
+                step_name,
+                input_esp=self.paths.input_esp,
+                output_json=self.paths.step1_dump,
+                output_priority=self.paths.step1_priority,
+                use_ja_ref=self.config.get("use_ja_ref", False),
+            )
+        elif step_name == "step2":
+            input_json = self.paths.step1_dump
+            out_json = self.paths.step2_translated
+            command = build_step_command(
+                step_name,
+                input_json=input_json,
+                output_json=out_json,
+                profile_json=self.paths.step2_profile,
+                tone_profile=self.paths.audio_tone_profile if self.paths.audio_tone_profile.exists() else None,
+                config=self.config_path,
+                use_ja_ref=self.config.get("use_ja_ref", False),
+            )
+        elif step_name == "review_step2":
+            if self.skip_review_step2:
+                self.manifest.update_step(step_name, status="skipped", reason="skip_review_step2 flag")
+                print(f"[SKIP] {step_name}")
+                return EXIT_SUCCESS
+            command = build_step_command(
+                "step5",
+                mode="step2",
+                input_json=self.paths.step2_translated,
+                output_json=self.paths.step2_reviewed,
+                tone_profile=self.paths.audio_tone_profile if self.paths.audio_tone_profile.exists() else None,
+                scan_output=self.paths.step2_scan,
+                config=self.config,
+                config_path=self.config_path
+            )
+        elif step_name == "scene_refine":
+            input_j = self.paths.step2_reviewed if self.paths.step2_reviewed.exists() else self.paths.step2_translated
+            command = build_step_command(
+                "scene_refine",
+                input_json=input_j,
+                output_json=self.paths.step2_tone_refined,
+                profile_json=self.paths.step2_profile,
+                config=self.config_path,
+            )
+        elif step_name == "step3":
+            # branch에 따라 step3 direct_build 여부 결정
+            branch_val = self.manifest.data.get("branch_type", "direct_xml")
+            direct_build = (branch_val == "direct_xml")
+            if self.paths.step2_tone_refined.exists():
+                input_j = self.paths.step2_tone_refined
+            else:
+                input_j = self.paths.step2_reviewed if self.paths.step2_reviewed.exists() else self.paths.step2_translated
+            
+            command = build_step_command(
+                "step3",
+                input_esp=self.paths.input_esp,
+                base_xml=self.paths.step0_xml,
+                input_json=input_j if not direct_build else None,
+                output_xml=self.paths.step3_merged,
+                direct_build=direct_build
+            )
+        elif step_name == "step4":
+            command = build_step_command(
+                step_name,
+                input_xml=self.paths.step3_merged,
+                output_xml=self.paths.step4_translated,
+                use_ja_ref=self.config.get("use_ja_ref", False),
+            )
+        elif step_name == "step5":
+            command = build_step_command(
+                step_name,
+                input_xml=self.paths.step4_translated,
+                output_xml=self.paths.step5_reviewed,
+                scan_output=self.paths.step5_scan,
+            )
+        elif step_name == "step6":
+            command = build_step_command(
+                step_name,
+                mode="refine",
+                input_file=self.paths.step5_reviewed,
+                output_xml=self.paths.step6_refined,
+                profile_json=self.paths.step2_profile,
+            )
+        elif step_name == "step7":
+            self._copy_final_output()
+            command = build_step_command(
+                step_name,
+                input_esp=self.paths.input_esp,
+                input_xml=self.paths.final_xml,
+                output_dir=self.paths.step7_output_dir,
+                config=self.config_path
+            )
+        else:
+            raise ValueError(f"Unsupported step: {step_name}")
+
+        # Manifest updates happen around the subprocess boundary so resume can
+        # reason about the exact last known state without inspecting logs.
+        self.manifest.update_step(step_name, status="running", command=[str(part) for part in command])
+        print(f"[RUN] {step_name}: {' '.join(str(part) for part in command)}")
+        return_code = run_subprocess(command)
+        if return_code == 0:
+            self.manifest.update_step(step_name, status="done")
+            for output_name in STEP_SPECS[step_name].outputs:
+                output_path = getattr(self.paths, output_name)
+                self.manifest.update_artifact_hash(Path(output_path).name, output_path)
+        else:
+            self.manifest.update_step(step_name, status="failed", return_code=return_code)
+        return return_code
+
+    def execute(self) -> int:
+        require_file(self.paths.input_esp, "input ESM")
+        self.paths.work_dir.mkdir(parents=True, exist_ok=True)
+        preflight_errors = self._preflight()
+        if preflight_errors:
+            self.manifest.update_step("preflight", status="failed", errors=preflight_errors)
+            for error in preflight_errors:
+                print(f"[PREFLIGHT ERROR] {error}", file=sys.stderr)
+            return EXIT_ARGUMENT_ERROR
+        self.manifest.update_step("preflight", status="done")
+        if self.dry_run or self.config.get("dry_run"):
+            report = self._dry_run_report()
+            report_path = self.paths.work_dir / f"{self.paths.stem}.dry_run.json"
+            report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            print_ok(report_path)
+            return EXIT_SUCCESS
+
+        # 1) 기초 단계 (step0, step1)
+        base_steps = ["step0", "step1"]
+        
+        started = False
+        for step_name in base_steps:
+            if step_name == self.from_step:
+                started = True
+            if not started:
+                continue
+            if self._should_skip(step_name):
+                self.manifest.update_step(step_name, status="skipped", reason="resume")
+                print(f"[SKIP] {step_name}: already completed")
+                continue
+            
+            # 여기서 branch_detect를 step1 직후에 실행
+            return_code = self._run_step(step_name)
+            if return_code != 0:
+                return return_code
+                
+            if step_name == "step1":
+                branch = self.branch_override or detect_branch(self.paths.step1_dump)
+                self.manifest.update_step("branch_detect", status="done")
+                self.manifest.data["branch_type"] = branch
+                
+                tone_method = self.tone_method_override or self.config.get("pipeline", {}).get("tone_profile_method", "audio")
+                self.manifest.data["tone_profile_method"] = tone_method
+                self.manifest._save()
+                print(f"[*] 분기 판정 완료: branch_type={branch}, tone_method={tone_method}")
+
+        # 2) branch 결과에 따른 후속 단계 결정
+        branch_type = self.manifest.data.get("branch_type", "direct_xml")
+        tone_method = self.manifest.data.get("tone_profile_method", "audio")
+        
+        subsequent_steps = []
+        if branch_type == "scene":
+            if tone_method == "audio":
+                subsequent_steps.extend(["audio_extract", "audio_profile"])
+            elif tone_method == "string":
+                subsequent_steps.append("audio_profile")
+            
+            subsequent_steps.extend(["step2", "review_step2"])
+            if self.include_step6:
+                subsequent_steps.append("scene_refine")
+            subsequent_steps.append("step3")
+        else:
+            subsequent_steps.append("step3")
+
+        subsequent_steps.extend(["step4", "step5"])
+        if self.include_step6 and branch_type != "scene":
+            subsequent_steps.append("step6")
+        if self.include_step7:
+            subsequent_steps.append("step7")
+
+        for step_name in subsequent_steps:
+            # from_step이 여기에 있을 경우 시작 시점 처리
+            if not started:
+                if step_name == self.from_step:
+                    started = True
+                else:
+                    continue
+            
+            if self._should_skip(step_name):
+                self.manifest.update_step(step_name, status="skipped", reason="resume")
+                print(f"[SKIP] {step_name}: already completed")
+                continue
+            
+            # audio_profile: string일 경우 내부적으로 모드 처리
+            if step_name == "audio_profile" and tone_method == "string":
+                # build_step_command에서 --mode string, --input-json 주입을 위해 _run_step 오버라이드
+                command = build_step_command(
+                    "audio_profile",
+                    config=self.config,          # dict
+                    config_path=self.config_path, # 경로
+                    mode="string",
+                    input_json=self.paths.step1_dump,
+                    output=self.paths.audio_tone_profile,
+                    priority_list=self.paths.step1_priority,
+                )
+                self.manifest.update_step(step_name, status="running", command=[str(part) for part in command])
+                print(f"[RUN] {step_name}: {' '.join(str(part) for part in command)}")
+                return_code = run_subprocess(command)
+                if return_code == 0:
+                    self.manifest.update_step(step_name, status="done")
+                else:
+                    self.manifest.update_step(step_name, status="failed", return_code=return_code)
+                    return return_code
+            else:
+                return_code = self._run_step(step_name)
+                if return_code != 0:
+                    return return_code
+
+        if not self.paths.final_xml.exists():
+            self._copy_final_output()
+        if self.paths.final_xml.exists():
+            print_ok(self.paths.final_xml)
+        return EXIT_SUCCESS
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Thin orchestrator for the standardized Starfield translation pipeline.")
+    parser.add_argument("--input-esp", dest="input_esp", required=False, help="Input ESM/ESP path")
+    parser.add_argument("-i", "--input", dest="legacy_input", required=False, help="Legacy alias for input ESM/ESP path")
+    parser.add_argument("--config", default="config.json", help="Config JSON path")
+    parser.add_argument("--from-step", default="step0", choices=get_step_sequence(include_step6=True, include_audio=True), help="Step to start from")
+    parser.add_argument("-s", "--step", dest="legacy_step", default=None, help="Legacy start step alias")
+    parser.add_argument("--include-step6", action="store_true", help="Include Step 6 refine pass")
+    parser.add_argument("--include-step7", action="store_true", help="Include Step 7 ESM update pass via xTranslator")
+    parser.add_argument("--resume", action="store_true", help="Resume from manifest and skip completed steps")
+    parser.add_argument("--work-dir", default=None, help="Optional working directory for pipeline outputs")
+    parser.add_argument("--branch", choices=["scene", "direct_xml"], help="Branch type override (scene | direct_xml)")
+    parser.add_argument("--tone-method", choices=["audio", "string"], help="Tone profile method override (audio | string)")
+    parser.add_argument("--skip-review-step2", action="store_true", help="Skip the JSON review step for speed")
+    parser.add_argument("--dry-run", action="store_true", help="Report expected work without LLM calls")
+    args = parser.parse_args()
+    args.input_esp = args.input_esp or args.legacy_input
+    if args.legacy_step is not None:
+        step_alias_map = {
+            "0": "step0",
+            "1": "step1",
+            "1.5": "audio_extract",
+            "2": "step2",
+            "3": "step3",
+            "4": "step4",
+            "5": "step5",
+            "6": "step6",
+            "7": "step7",
+        }
+        args.from_step = step_alias_map.get(str(args.legacy_step), args.from_step)
+    return args
+
+
+def main() -> int:
+    args = _parse_args()
+    if not args.input_esp:
+        print("Error: --input-esp is required.", file=sys.stderr)
+        return EXIT_ARGUMENT_ERROR
+    try:
+        pipeline = AutoPipeline(
+            input_esp=args.input_esp,
+            config_path=args.config,
+            from_step=args.from_step,
+            include_step6=args.include_step6,
+            include_step7=args.include_step7,
+            resume=args.resume,
+            work_dir=args.work_dir,
+            branch=args.branch,
+            tone_method=args.tone_method,
+            skip_review_step2=args.skip_review_step2,
+            dry_run=args.dry_run,
+        )
+        return pipeline.execute()
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return EXIT_INPUT_MISSING
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return EXIT_INTERNAL_ERROR
+
+
+if __name__ == "__main__":
+    sys.exit(main())

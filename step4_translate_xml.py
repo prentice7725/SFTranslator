@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import signal
+import sys
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -10,6 +11,20 @@ from typing import Dict, List, Tuple
 
 from db_manager import DBRAG, load_glossary_db
 from llm_backend import get_llm_backend
+from pipeline_runner import (
+    EXIT_ARGUMENT_ERROR,
+    EXIT_INPUT_MISSING,
+    EXIT_INTERNAL_ERROR,
+    EXIT_SUCCESS,
+    ensure_parent,
+    print_ok,
+    require_file,
+)
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # =============================================================================
 # ⚙️ 설정 (CONFIG)
@@ -214,6 +229,11 @@ def build_batch_prompt(masked_batch: list) -> str:
         payload.append(item)
 
     glossary_str = "\n".join(f"- {k}: {v}" for k, v in GLOSSARY.items())
+    glossary_instruction = (
+        "아래 용어집을 무조건 준수해:\n" + glossary_str
+        if glossary_str
+        else "용어집이 없습니다. 게임 문맥에 맞게 번역하세요."
+    )
 
     prompt = f"""번호 순서대로 주어진 'text' 요소들을 하나도 빠짐없이 전부 번역해 줘.
 작업할 개수: {len(masked_batch)}개
@@ -223,7 +243,7 @@ def build_batch_prompt(masked_batch: list) -> str:
 
 **지시사항:**
 1. [[TAG_n]] 형태의 플레이스홀더는 **절대 번역하거나 수정하지 말고** 원문 그대로 복사해 출력해.
-2. {"아래 용어집을 무조건 준수해:\n" + glossary_str if glossary_str else "용어집이 없습니다. 게임 문맥에 맞게 번역하세요."}
+2. {glossary_instruction}
 3. 모든 ID(0부터 {len(masked_batch) - 1}까지)를 결과 JSON 배열에 반드시 포함해야 해. 하나라도 누락되면 안 돼.
 4. 결과는 아래 예시처럼 JSON 배열 형태로만 줘. 여분의 설명은 절대 하지 마.
 
@@ -243,6 +263,11 @@ def translate_single_item(src: str, rec: str, backend, ja: str = None) -> str:
     """[Step 4] 장문 전용 1:1 단독 번역 처리기"""
     masked, tags = TagPreserver.mask_tags(src)
     g_str = "\n".join(f"- {k}: {v}" for k, v in GLOSSARY.items())
+    glossary_instruction = (
+        "아래 용어집을 무조건 준수해:\n" + g_str
+        if g_str
+        else "용어집이 없습니다."
+    )
 
     ja_info = f"\n**일본어 참조:**\n{ja}\n" if ja else ""
 
@@ -253,7 +278,7 @@ def translate_single_item(src: str, rec: str, backend, ja: str = None) -> str:
 
 **규칙:**
 1. [[TAG_n]] 플레이스홀더 절대 수정 금지
-2. {"아래 용어집을 무조건 준수해:\n" + g_str if g_str else "용어집이 없습니다."}
+2. {glossary_instruction}
 3. 번역문만 출력 (여타 설명 금지)
 4. rec 타입: {rec}
 
@@ -423,9 +448,11 @@ signal.signal(signal.SIGTERM, signal_handler)
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser("Step 4 XML Translator (5-Step Optimized)")
-    parser.add_argument("-i", "--input", required=True, help="Path to input XML")
+    parser.add_argument("--input-xml", dest="input_xml", default=None, help="Standardized input XML path")
+    parser.add_argument("--output-xml", dest="output_xml", default=None, help="Standardized output XML path")
+    parser.add_argument("-i", "--input", required=False, help="Path to input XML")
     parser.add_argument(
-        "-o", "--output", default="translate_full.xml", help="Path to output XML"
+        "-o", "--output", default=None, help="Path to output XML"
     )
     parser.add_argument(
         "--use-ja-ref", action="store_true", help="일본어 원문 참조 모드 활성"
@@ -435,8 +462,21 @@ def main():
     )
     args = parser.parse_args()
 
-    target_xml = args.input
-    progress_path = Path(args.output).with_suffix(".progress.xml")
+    args.input = args.input_xml or args.input
+    args.output = args.output_xml or args.output
+    if not args.input or not args.output:
+        print("Error: --input-xml and --output-xml are required.", file=sys.stderr)
+        return EXIT_ARGUMENT_ERROR
+
+    try:
+        input_xml = require_file(args.input, "input XML")
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return EXIT_INPUT_MISSING
+
+    output_xml = ensure_parent(args.output)
+    target_xml = str(input_xml)
+    progress_path = output_xml.with_suffix(".progress.xml")
     if progress_path.exists():
         log.info(f"임시 작업 파일 발견! 이어하기를 시도합니다: {progress_path.name}")
         target_xml = str(progress_path)
@@ -452,12 +492,37 @@ def main():
                 config = json.load(_f)
         except Exception:
             pass
-    backend = get_llm_backend(
-        config,
-        "step4_prompt",
-        max_retries=Config.MAX_RETRIES,
-        retry_base_wait=Config.RETRY_BASE_WAIT,
-    )
+    try:
+        from orchestrator import TranslationOrchestrator
+        orch_cfg = config.get("orchestrator", {})
+        if orch_cfg.get("enabled"):
+            # [사용자 요청] Step 4는 단문 위주이므로 오케스트레이터를 생략하고 
+            # 감수용 고성능 모델(Review Model) 단독으로 처리하여 속도/비용 최적화
+            review_cfg = orch_cfg.get("review_model", {})
+            r_config = config.copy()
+            r_config["provider"] = review_cfg.get("provider", config.get("provider"))
+            r_config["model_name"] = review_cfg.get("model", config.get("model_name"))
+            
+            log.info(f"🚀 Step 4: 오케스트레이터를 우회하여 고성능 모델({r_config['model_name']})로 직접 번역합니다.")
+            backend = get_llm_backend(
+                r_config, 
+                "step4_prompt",
+                max_retries=Config.MAX_RETRIES,
+                retry_base_wait=Config.RETRY_BASE_WAIT
+            )
+        else:
+            backend = get_llm_backend(
+                config,
+                "step4_prompt",
+                max_retries=Config.MAX_RETRIES,
+                retry_base_wait=Config.RETRY_BASE_WAIT,
+            )
+    except Exception as e:
+        log.error(f"백엔드 또는 오케스트레이터 초기화 실패: {e}")
+        import traceback
+        log.error(traceback.format_exc())
+        import sys
+        sys.exit(1)
 
     # 모드 이름 결정
     mod_stem = args.mod_name
@@ -598,11 +663,29 @@ def main():
         tree.write(str(progress_path), encoding="utf-8", xml_declaration=True)
         log.info(f"⚠️ 중지됨. 진행 상황 보존: {progress_path}")
     else:
-        tree.write(str(args.output), encoding="utf-8", xml_declaration=True)
-        log.info(f"✅ Step 4 완벽히 완료! 결과물 저장: {args.output}")
+        tree.write(str(output_xml), encoding="utf-8", xml_declaration=True)
+        log.info(f"✅ Step 4 완벽히 완료! 결과물 저장: {output_xml}")
         if progress_path.exists():
             progress_path.unlink()
 
+    # 성공적으로 완료된 경우 오케스트레이터의 임시 캐시 삭제
+    from orchestrator import TranslationOrchestrator
+    if isinstance(backend, TranslationOrchestrator):
+        backend.cleanup()
+
+    # 1min.ai 누적 크레딧 출력
+    from llm_backend import Min1AIBackend
+    if Min1AIBackend.total_used_credit > 0:
+        log.info(f"\n[결산] 이번 세션에서 사용된 총 1min.ai 크레딧: {Min1AIBackend.total_used_credit}")
+    if not b_stop_requested:
+        print_ok(output_xml)
+        return EXIT_SUCCESS
+    return EXIT_SUCCESS
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(EXIT_INTERNAL_ERROR)

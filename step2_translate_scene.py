@@ -4,10 +4,34 @@ import json
 import logging
 import os
 import argparse
+import re
 import signal
+import sys
 from pathlib import Path
 
 import json_repair
+from pipeline_runner import (
+    EXIT_ARGUMENT_ERROR,
+    EXIT_INPUT_MISSING,
+    EXIT_INTERNAL_ERROR,
+    EXIT_SUCCESS,
+    ensure_parent,
+    print_ok,
+    require_file,
+)
+from prd_contract import (
+    PROMPT_VERSION,
+    TOOL_VERSION,
+    add_item_contract,
+    estimate_tokens,
+    extract_preserved_tokens,
+    risk_flags,
+)
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # 로거 및 설정
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s | %(message)s")
@@ -17,6 +41,24 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 CONFIG_FILE = SCRIPT_DIR / "config.json"
 
 b_stop_requested = False
+
+FATAL_LLM_ERROR_KEYWORDS = (
+    "iam_permission_denied",
+    "permission 'aiplatform.endpoints.predict'",
+    "permission denied",
+    "defaultcredentialserror",
+    "google_application_credentials",
+)
+
+
+def is_fatal_llm_error(exc) -> bool:
+    err = str(exc).lower()
+    return any(keyword in err for keyword in FATAL_LLM_ERROR_KEYWORDS)
+
+
+def is_max_tokens_error(exc) -> bool:
+    return "max_tokens" in str(exc).lower()
+
 
 def signal_handler(sig, frame):
     global b_stop_requested
@@ -37,9 +79,10 @@ except ImportError:
 # =============================================================================
 # 유틸리티
 # =============================================================================
-def load_config():
-    if CONFIG_FILE.exists():
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+def load_config(config_path: str | Path | None = None):
+    target = Path(config_path).expanduser().resolve() if config_path else CONFIG_FILE
+    if target.exists():
+        with open(target, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
@@ -49,13 +92,62 @@ def generate_text_hash(text: str) -> str:
 def is_only_tags_and_punct(text: str) -> bool:
     """태그와 문장 부호만 있는 경우 제외 (예: <Alias=Name>.)"""
     if not text: return True
-    import re
     # 1. 모든 <...> 형태의 태그 제거
     stripped = re.sub(r"<[^>]+>", "", text)
     # 2. 공백 및 일반적인 문장 부호 제거
     stripped = re.sub(r'[\s.,!?;:"\'-_\[\]()]+', "", stripped)
     # 3. 남은 문자가 없으면 태그/부호만 있는 것으로 간주
     return len(stripped) == 0
+
+
+def assess_translation_risks(id_map: dict, translations: dict) -> list[dict]:
+    risks = []
+    for bid, item in id_map.items():
+        src = str(item.get("Text", "") or "")
+        dst = str(translations.get(bid, "") or "").strip()
+        for flag in risk_flags(src, dst, item):
+            risks.append({"batch_id": bid, "stable_id": item.get("stable_id"), **flag})
+    return risks
+
+
+def build_adaptive_chunks(items: list[dict], max_items: int, max_chars: int, max_tokens: int) -> list[list[dict]]:
+    chunks = []
+    current = []
+    current_chars = 0
+    current_tokens = 0
+    for item in items:
+        text = str(item.get("Text", "") or "")
+        text_len = len(text)
+        token_count = estimate_tokens(text) * 2
+        would_exceed_items = len(current) >= max_items
+        would_exceed_chars = current and current_chars + text_len > max_chars
+        would_exceed_tokens = current and current_tokens + token_count > max_tokens
+        if would_exceed_items or would_exceed_chars or would_exceed_tokens:
+            chunks.append(current)
+            current = []
+            current_chars = 0
+            current_tokens = 0
+        current.append(item)
+        current_chars += text_len
+        current_tokens += token_count
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def build_chunk_log_entry(chunk_id: str, chunk: list[dict], model: str, retry_count: int = 0, split_reason: str = "") -> dict:
+    source_chars = sum(len(str(item.get("Text", "") or "")) for item in chunk)
+    input_tokens = sum(estimate_tokens(str(item.get("Text", "") or "")) for item in chunk)
+    return {
+        "chunk_id": chunk_id,
+        "line_count": len(chunk),
+        "source_chars": source_chars,
+        "estimated_input_tokens": input_tokens,
+        "estimated_output_tokens": input_tokens,
+        "model": model,
+        "retry_count": retry_count,
+        "split_reason": split_reason,
+    }
 
 # =============================================================================
 # 말투 프로파일링
@@ -170,77 +262,192 @@ def build_scene_prompt(chunk_items, mod_stem, context_lines, scene_profile, glos
 1. NPC는 지정된 말투를 끝까지 고수할 것. 
 2. 단, 'Player'는 상대와 상황에 따라 말투를 유연하게 바꿀 것.
 3. 용어집 준수: {glossary_text}
-4. 결과는 오직 JSON: {{ "BatchID": "번역문" }}
+4. 무조건 아래 JSON 형식으로만 응답할 것. 추가적인 부연 설명은 절대 금지. (BatchID 키는 B0, B1 등 원문에서 주어진 식별자를 그대로 사용하세요)
+{{
+  "B0": "번역문 0",
+  "B1": "번역문 1"
+}}
 """
     return instructions + "\n\n" + "\n".join(dialogue_blocks), id_map
 
-def translate_scene_recursive(chunk_items, backend, mod_stem, context_lines, scene_profile, glossary_text, rag, tone_profiles, depth=0):
+def translate_scene_recursive(chunk_items, backend, mod_stem, context_lines, scene_profile, glossary_text, rag, tone_profiles, depth=0, orchestration_backend=None, risk_report=None):
     if not chunk_items or depth > 5 or b_stop_requested:
         return
 
     prompt, id_map = build_scene_prompt(chunk_items, mod_stem, context_lines, scene_profile, glossary_text, rag, tone_profiles)
 
     try:
-        raw = backend.generate_content(prompt)
+        from orchestrator import TranslationOrchestrator
+
+        char_profile_info = ""
+        context_info = ""
+        if isinstance(backend, TranslationOrchestrator) or orchestration_backend:
+            char_profile_info = f"씬 분위기: {scene_profile.get('scene_mood', '')}\n"
+            for spk, guide in scene_profile.get("character_guidelines", {}).items():
+                char_profile_info += f"- {spk}: {guide}\n"
+            for ctx in context_lines:
+                context_info += f"[{ctx.get('Speaker')}] {ctx.get('Text')}\n"
+
+        def generate_with(selected_backend):
+            if isinstance(selected_backend, TranslationOrchestrator):
+                return selected_backend.translate_with_review(prompt, context_info=context_info, char_profile=char_profile_info)
+            return selected_backend.generate_content(prompt)
+
+        raw = generate_with(backend)
+        
         res = json_repair.repair_json(raw, return_objects=True)
 
         if isinstance(res, dict):
             # 모든 요청 ID가 포함되었는지 확인
             missing_ids = [bid for bid in id_map if bid not in res or not str(res[bid]).strip()]
             if missing_ids:
-                if len(chunk_items) > 1:
+                if orchestration_backend:
+                    raise ValueError(f"Risky translation: missing ids {missing_ids}")
+                elif len(chunk_items) > 1:
                     raise ValueError(f"Partial translation detected ({len(missing_ids)}/{len(id_map)} items missing).")
                 else:
                     log.error(f"  [Error] 단일 항목 번역 실패: {chunk_items[0].get('Text')[:30]}...")
+
+            risks = assess_translation_risks(id_map, res)
+            orchestration_risks = [r for r in risks if r.get("severity") in {"fatal", "quality"}]
+            if orchestration_risks and orchestration_backend:
+                risk_codes = [r.get("code", "") for r in orchestration_risks[:5]]
+                log.info(f"  -> 위험 청크 감지 ({', '.join(risk_codes)}). 오케스트레이션 재번역을 시도합니다.")
+                if risk_report is not None:
+                    risk_report.append({"depth": depth, "size": len(chunk_items), "risks": risks})
+                raw = generate_with(orchestration_backend)
+                res = json_repair.repair_json(raw, return_objects=True)
+                if not isinstance(res, dict):
+                    raise ValueError("Invalid orchestration JSON response (not a dict)")
+                missing_ids = [bid for bid in id_map if bid not in res or not str(res[bid]).strip()]
+                if missing_ids and len(chunk_items) > 1:
+                    raise ValueError(f"Partial orchestration translation detected ({len(missing_ids)}/{len(id_map)} items missing).")
             
             for bid, trans in res.items():
                 if bid in id_map:
                     id_map[bid]["Translate"] = trans
+                    id_map[bid]["translation"] = trans
+                    id_map[bid]["model"] = getattr(backend, "model_name", backend.__class__.__name__)
+                    id_map[bid].setdefault("chunk_id", "")
+                    id_map[bid]["risk_flags"] = risk_flags(str(id_map[bid].get("Text", "") or ""), str(trans or ""), id_map[bid])
+                    id_map[bid].setdefault("glossary_hits", [])
+                    id_map[bid].setdefault("translation_class", "TRANSLATE")
         else:
             raise ValueError("Invalid JSON response (not a dict)")
 
     except Exception as e:
+        if is_fatal_llm_error(e):
+            log.error(f"치명적 LLM 인증/권한 오류로 번역을 중단합니다: {e}")
+            raise
         log.warning(f"Error at depth {depth}: {e}. Splitting chunk...")
+        if orchestration_backend and not is_max_tokens_error(e):
+            try:
+                log.info("  -> fast 번역 실패. 청크 분할 전에 오케스트레이션으로 복구를 시도합니다.")
+                translate_scene_recursive(chunk_items, orchestration_backend, mod_stem, context_lines, scene_profile, glossary_text, rag, tone_profiles, depth, None, risk_report)
+                return
+            except Exception as orch_e:
+                if is_fatal_llm_error(orch_e):
+                    raise
+                log.warning(f"오케스트레이션 복구 실패: {orch_e}")
         if len(chunk_items) > 1:
             mid = len(chunk_items) // 2
-            translate_scene_recursive(chunk_items[:mid], backend, mod_stem, context_lines, scene_profile, glossary_text, rag, tone_profiles, depth + 1)
-            translate_scene_recursive(chunk_items[mid:], backend, mod_stem, chunk_items[:mid], scene_profile, glossary_text, rag, tone_profiles, depth + 1)
+            translate_scene_recursive(chunk_items[:mid], backend, mod_stem, context_lines, scene_profile, glossary_text, rag, tone_profiles, depth + 1, orchestration_backend, risk_report)
+            translate_scene_recursive(chunk_items[mid:], backend, mod_stem, chunk_items[:mid], scene_profile, glossary_text, rag, tone_profiles, depth + 1, orchestration_backend, risk_report)
 
 # =============================================================================
 # 메인 실행부
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-i", "--input", required=True, help="Extract JSON path (Step 1 output)")
-    parser.add_argument("-o", "--output", required=True, help="Output translated JSON path")
+    parser.add_argument("--input-json", dest="input_json", default=None, help="Standardized Step 1 JSON input path")
+    parser.add_argument("--output-json", dest="output_json", default=None, help="Standardized translated JSON output path")
+    parser.add_argument("--profile-json", dest="profile_json", default=None, help="Standardized scene profile JSON output path")
+    parser.add_argument("--config", default=str(CONFIG_FILE), help="Config JSON path")
+    parser.add_argument("-i", "--input", required=False, help="Extract JSON path (Step 1 output)")
+    parser.add_argument("-o", "--output", required=False, help="Output translated JSON path")
     parser.add_argument("--use-ja-ref", action="store_true", help="Use Japanese references")
     parser.add_argument("--profile-only", action="store_true", help="Generate profile only")
-    parser.add_argument("--tone-profiles", default="tone_profiles.json", help="Path to tone_profiles.json")
+    parser.add_argument("--tone-profile", dest="tone_profile", default=None, help="Path to audio tone profile JSON")
+    parser.add_argument("--tone-profiles", default=None, help="Legacy alias for tone profile JSON path")
     args = parser.parse_args()
+    args.input = args.input_json or args.input
+    args.output = args.output_json or args.output
+    if not args.input or not args.output:
+        print("Error: --input-json and --output-json are required.", file=sys.stderr)
+        return EXIT_ARGUMENT_ERROR
 
-    config = load_config()
+    try:
+        in_path = require_file(args.input, "input")
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return EXIT_INPUT_MISSING
+
+    out_path = ensure_parent(args.output)
+    profile_path = ensure_parent(args.profile_json or out_path.with_name(out_path.stem + "_profile.json"))
+    tone_profile_arg = args.tone_profile or args.tone_profiles
+
+    # The shared runner passes the config path explicitly so every entrypoint
+    # resolves prompts and backend settings the same way.
+    config = load_config(args.config)
+
+    glossary_dict = load_glossary_db()
+    glossary_text = "\n".join([f"- {k}: {v}" for k, v in glossary_dict.items()])
     
     # llm_backend.py 의 get_llm_backend 사용
     try:
         from llm_backend import get_llm_backend
+        from orchestrator import TranslationOrchestrator
+        
+        orch_cfg = config.get("orchestrator", {})
+        orch_mode = str(orch_cfg.get("mode", "always" if orch_cfg.get("enabled") else "off")).lower()
+        orchestration_backend = None
         backend = get_llm_backend(config, "step2_prompt")
+        profile_backend = get_llm_backend(config, "step2_prompt", role="audio_profile")
+
+        if orch_cfg.get("enabled") and orch_mode in ("always", "risky_only"):
+            log.info(f"멀티 모델 오케스트레이터 모드 활성화: {orch_mode}")
+            gen_backends = []
+            for m in orch_cfg.get("generation_models", []):
+                # 각 모델별 페르소나를 시스템 인스트럭션에 결합
+                m_config = config.copy()
+                m_config["provider"] = m["provider"]
+                m_config["api_provider"] = m["provider"]
+                m_config["model_name"] = m["model"]
+                persona_prompt = f"{config.get('step2_prompt', '')}\n\n[페르소나] {m['persona']}"
+                # 임시 키로 step2_prompt를 덮어씌워서 get_llm_backend가 이를 사용하게 함
+                m_config["_temp_prompt"] = persona_prompt
+                gen_backends.append(get_llm_backend(m_config, "_temp_prompt"))
+            
+            review_cfg = orch_cfg.get("review_model", {})
+            r_config = config.copy()
+            r_config["provider"] = review_cfg["provider"]
+            r_config["api_provider"] = review_cfg["provider"]
+            r_config["model_name"] = review_cfg["model"]
+            review_backend = get_llm_backend(r_config, "step2_prompt")
+            
+            orchestration_backend = TranslationOrchestrator(gen_backends, review_backend, glossary_text=glossary_text, work_dir=out_path.parent)
+            if orch_mode == "always":
+                backend = orchestration_backend
     except Exception as e:
-        log.error(f"백엔드 초기화 실패: {e}")
-        return
+        log.error(f"백엔드 또는 오케스트레이터 초기화 실패: {e}")
+        import traceback
+        log.error(traceback.format_exc())
+        import sys
+        sys.exit(1)
 
     rag = DBRAG()
-    glossary_dict = load_glossary_db()
-    glossary_text = "\n".join([f"- {k}: {v}" for k, v in glossary_dict.items()])
 
-    in_path = Path(args.input)
-    out_path = Path(args.output)
+    in_path = Path(in_path)
+    out_path = Path(out_path)
     mod_stem = in_path.stem.replace("_dump", "")
+    progress_path = out_path.with_suffix(".progress.json")
+    
+    target_in = str(in_path)
+    if progress_path.exists():
+        log.info(f"임시 작업 파일 발견! 이어하기를 시도합니다: {progress_path.name}")
+        target_in = str(progress_path)
 
-    if not in_path.exists():
-        log.error(f"입력 파일을 찾을 수 없습니다: {in_path}")
-        return
-
-    with open(in_path, "r", encoding="utf-8") as f:
+    with open(target_in, "r", encoding="utf-8") as f:
         scenes_data = json.load(f)
 
     if isinstance(scenes_data, list):
@@ -248,8 +455,8 @@ def main():
     else:
         quests = scenes_data.get("Quests", [])
     
-    # 프로파일 경로: 출력 파일명 기반
-    profile_path = out_path.with_name(out_path.stem + "_profile.json")
+    # Quest profiles are reused across reruns so profile-only and full runs
+    # can share the expensive analysis output.
     all_profiles = {}
     if profile_path.exists():
         try:
@@ -258,9 +465,16 @@ def main():
         except:
             all_profiles = {}
 
-    # 오디션 분석 결과(tone_profiles) 로드
+    # Tone profiles come from the optional audio side pipeline and are safe to
+    # omit; translation falls back to text-only context when absent.
     tone_profiles = {}
-    tp_path = Path(args.tone_profiles)
+    if not tone_profile_arg:
+        candidate_paths = [
+            in_path.parent / f"{mod_stem}.audio.tone_profiles.json",
+            in_path.parent / "tone_profiles.json",
+        ]
+        tone_profile_arg = next((str(candidate) for candidate in candidate_paths if candidate.exists()), None)
+    tp_path = Path(tone_profile_arg) if tone_profile_arg else Path("")
     if tp_path.exists():
         log.info(f"음성 분석 프로필 로드 중: {tp_path}")
         with open(tp_path, "r", encoding="utf-8") as f:
@@ -276,7 +490,7 @@ def main():
         if q_id in all_profiles:
             q_profile = all_profiles[q_id]
         else:
-            q_profile = profile_scene(quest, backend, args.use_ja_ref, mod_stem, rag)
+            q_profile = profile_scene(quest, profile_backend, args.use_ja_ref, mod_stem, rag)
             all_profiles[q_id] = q_profile
             with open(profile_path, "w", encoding="utf-8") as f:
                 json.dump(all_profiles, f, ensure_ascii=False, indent=2)
@@ -284,22 +498,30 @@ def main():
         if args.profile_only: continue
 
         dial_flat_list = []
+        # Scene JSON is nested, but translation runs over a flat list so chunking
+        # and context windows behave consistently across scenes and choices.
         # Scenes 내부 데이터 평탄화
         for s in quest.get("Scenes", []):
             for d in s.get("Dials", []):
                 for dial in d.get("Dialogues", []):
                     txt = dial.get("Text")
                     if txt:
-                        if is_only_tags_and_punct(txt):
+                        if dial.get("Translate"):
+                            pass
+                        elif is_only_tags_and_punct(txt):
                             dial["Translate"] = txt
                         else:
+                            add_item_contract(dial, plugin_name=mod_stem, record_type=dial.get("record_type", "INFO"), subrecord_path=dial.get("subrecord_path", "NAM1"))
                             dial_flat_list.append(dial)
                     for choice in dial.get("PlayerChoices", []):
                         ctxt = choice.get("Text")
                         if ctxt:
-                            if is_only_tags_and_punct(ctxt):
+                            if choice.get("Translate"):
+                                pass
+                            elif is_only_tags_and_punct(ctxt):
                                 choice["Translate"] = ctxt
                             else:
+                                add_item_contract(choice, plugin_name=mod_stem, record_type=choice.get("record_type", "INFO"), subrecord_path=choice.get("subrecord_path", "CHOICE"))
                                 dial_flat_list.append(choice)
         
         # StandaloneDials 평탄화
@@ -307,35 +529,98 @@ def main():
             for d in dial.get("Dialogues", []):
                 txt = d.get("Text")
                 if txt:
-                    if is_only_tags_and_punct(txt):
+                    if d.get("Translate"):
+                        pass
+                    elif is_only_tags_and_punct(txt):
                         d["Translate"] = txt
                     else:
+                        add_item_contract(d, plugin_name=mod_stem, record_type=d.get("record_type", "INFO"), subrecord_path=d.get("subrecord_path", "NAM1"))
                         dial_flat_list.append(d)
                 for choice in d.get("PlayerChoices", []):
                     ctxt = choice.get("Text")
                     if ctxt:
-                        if is_only_tags_and_punct(ctxt):
+                        if choice.get("Translate"):
+                            pass
+                        elif is_only_tags_and_punct(ctxt):
                             choice["Translate"] = ctxt
                         else:
+                            add_item_contract(choice, plugin_name=mod_stem, record_type=choice.get("record_type", "INFO"), subrecord_path=choice.get("subrecord_path", "CHOICE"))
                             dial_flat_list.append(choice)
 
-        chunks = [dial_flat_list[i : i + 20] for i in range(0, len(dial_flat_list), 20)]
+        chunk_size = int(config.get("step2_chunk_size", config.get("chunk_size", 40)))
+        max_chunk_chars = int(config.get("step2_max_chunk_chars", 3500))
+        max_input_tokens = int(config.get("step2_max_input_tokens", 6000))
+        max_output_tokens = int(config.get("step2_max_output_tokens", 4000))
+        chunks = build_adaptive_chunks(dial_flat_list, chunk_size, max_chunk_chars, max_input_tokens + max_output_tokens)
         recent_context = []
+        risk_report = []
+        chunk_log = []
 
         num_chunks = len(chunks)
         for i, chunk in enumerate(chunks):
             if b_stop_requested: break
+            chunk_id = f"{q_id}_chunk_{i + 1:03d}"
+            for item in chunk:
+                item["chunk_id"] = chunk_id
+            chunk_log.append(build_chunk_log_entry(chunk_id, chunk, str(config.get("model_name") or config.get("models", {}).get("translation", "fast_translation"))))
             log.info(f"  -> [청크 {i+1}/{num_chunks}] {len(chunk)}개 대사 번역 중...")
             
             # 번역 대상이 이미 채워져 있는지 확인 (중복 번역 방지 로직은 필요시 추가)
-            translate_scene_recursive(chunk, backend, mod_stem, recent_context, q_profile, glossary_text, rag, tone_profiles)
+            translate_scene_recursive(chunk, backend, mod_stem, recent_context, q_profile, glossary_text, rag, tone_profiles, orchestration_backend=orchestration_backend, risk_report=risk_report)
+            # Keep a short trailing window so adjacent chunks stay coherent
+            # without letting prompts grow indefinitely.
             recent_context = chunk[-5:]
 
-            # 중간 저장 (실시간 반영)
-            with open(out_path, "w", encoding="utf-8") as f:
+            # 중간 저장 (실시간 반영은 임시 파일에)
+            with open(progress_path, "w", encoding="utf-8") as f:
                 json.dump(scenes_data, f, ensure_ascii=False, indent=2)
 
-    log.info("모든 작업이 완료되었습니다.")
+        if risk_report:
+            risk_path = out_path.with_suffix(".risk_report.json")
+            with open(risk_path, "w", encoding="utf-8") as f:
+                json.dump(risk_report, f, ensure_ascii=False, indent=2)
+        if chunk_log:
+            chunk_log_path = out_path.with_suffix(".chunk_log.json")
+            with open(chunk_log_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "prompt_version": PROMPT_VERSION,
+                        "tool_version": TOOL_VERSION,
+                        "chunks": chunk_log,
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+    if b_stop_requested:
+        log.info(f"⚠️ 중지됨. 진행 상황 보존: {progress_path}")
+        # 중지되었을 때는 out_path를 쓰지 않고 progress_path만 남깁니다.
+    else:
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(scenes_data, f, ensure_ascii=False, indent=2)
+        if progress_path.exists():
+            progress_path.unlink()
+        
+        log.info("모든 작업이 완료되었습니다.")
+        
+        # 성공적으로 완료된 경우 오케스트레이터의 임시 캐시 삭제
+        from orchestrator import TranslationOrchestrator
+        if isinstance(backend, TranslationOrchestrator):
+            backend.cleanup()
+        elif isinstance(orchestration_backend, TranslationOrchestrator):
+            orchestration_backend.cleanup()
+
+    # 1min.ai 누적 크레딧 출력
+    from llm_backend import Min1AIBackend
+    if Min1AIBackend.total_used_credit > 0:
+        log.info(f"\n[결산] 이번 세션에서 사용된 총 1min.ai 크레딧: {Min1AIBackend.total_used_credit}")
+    print_ok(out_path if not args.profile_only else profile_path)
+    return EXIT_SUCCESS
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(EXIT_INTERNAL_ERROR)

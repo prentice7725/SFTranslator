@@ -9,6 +9,7 @@ SSTXMLRessources 형식의 XML 파일로 번역 대상 텍스트를 추출하는
 import struct
 import os
 import re
+import sys
 import zlib
 import argparse
 from dataclasses import dataclass
@@ -16,6 +17,22 @@ from typing import Dict, List, Tuple, Optional, BinaryIO
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 from datetime import datetime
+from pipeline_runner import (
+    EXIT_ARGUMENT_ERROR,
+    EXIT_INPUT_MISSING,
+    EXIT_INTERNAL_ERROR,
+    EXIT_OUTPUT_FAILURE,
+    EXIT_SUCCESS,
+    ensure_parent,
+    print_ok,
+    require_file,
+)
+from prd_contract import classify_translation, context_id, make_stable_id, source_hash
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 HEADER_TES4 = b'TES4'
 HEADER_GRUP = b'GRUP'
@@ -621,6 +638,7 @@ def write_xml(entries: List[StringEntry], output_path: str, addon_name: str):
     SSTXMLRessources 형식의 XML 문서를 생성하고 디스크에 기록합니다.
     """
     root = ET.Element("SSTXMLRessources")
+    plugin_stem = os.path.splitext(addon_name)[0]
     params = ET.SubElement(root, "Params")
     ET.SubElement(params, "Addon").text = addon_name
     ET.SubElement(params, "Source").text = "en"
@@ -631,6 +649,18 @@ def write_xml(entries: List[StringEntry], output_path: str, addon_name: str):
     for entry in entries:
         s_node = ET.SubElement(content, "String")
         s_node.set("List", entry.list_id)
+        sid = make_stable_id(
+            plugin_stem,
+            f"{entry.form_id:08X}",
+            entry.rec_type,
+            entry.field_type,
+            entry.field_index,
+            entry.source_text,
+        )
+        s_node.set("stable_id", sid)
+        s_node.set("source_hash", source_hash(entry.source_text))
+        s_node.set("context_id", context_id(f"{entry.form_id:08X}", entry.rec_type, entry.field_type, entry.field_index))
+        s_node.set("translation_class", classify_translation(entry.source_text, entry.rec_type, entry.field_type))
         if entry.string_id > 0:
             s_node.set("sID", f'{entry.string_id:06X}')
         edid_text = entry.edid if entry.edid else f"[{entry.form_id:08X}]"
@@ -799,8 +829,12 @@ def main():
     """
     parser = argparse.ArgumentParser(
         description="Parse ESM/ESP and export xTranslator-compatible XML.")
+    parser.add_argument("--input-esp", dest="input_esp", default=None,
+                        help="Standardized single-file input ESM/ESP path.")
+    parser.add_argument("--output-xml", dest="output_xml", default=None,
+                        help="Standardized single-file output XML path.")
     parser.add_argument("-i", "--input",
-                        required=True,
+                        required=False,
                         help="Path to input ESM/ESP file OR directory (recursive).")
     parser.add_argument("-o", "--output-dir", default=None,
                         help="Output directory for XML files. Default: same folder as each ESM.")
@@ -814,6 +848,41 @@ def main():
                         help="Path for the processing log TXT file. "
                              "Default: processed_log_[datetime].txt in the output/current directory.")
     args = parser.parse_args()
+
+    if args.input_esp:
+        args.input = args.input_esp
+
+    if not args.input:
+        print("Error: input ESM/ESP path is required.", file=sys.stderr)
+        return EXIT_ARGUMENT_ERROR
+
+    if args.output_xml:
+        try:
+            input_path = require_file(args.input, "input")
+            output_xml = ensure_parent(args.output_xml)
+        except FileNotFoundError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return EXIT_INPUT_MISSING
+
+        try:
+            result = process_single_esm(
+                str(input_path),
+                str(output_xml.parent),
+                args.strings_dir,
+                args.lang,
+                use_ja_ref=args.use_ja_ref,
+            )
+            if result.status != "OK" or not result.xml_path:
+                print(f"Error: XML export failed ({result.status}).", file=sys.stderr)
+                return EXIT_OUTPUT_FAILURE
+            generated_xml = os.path.abspath(result.xml_path)
+            if os.path.abspath(str(output_xml)) != generated_xml:
+                os.replace(generated_xml, str(output_xml))
+            print_ok(output_xml)
+            return EXIT_SUCCESS
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return EXIT_INTERNAL_ERROR
 
     in_path = os.path.abspath(args.input)
     results: List[ProcessResult] = []
@@ -833,7 +902,7 @@ def main():
         total = len(esm_files)
         if total == 0:
             print(f"No .esm files found in: {in_path}")
-            return
+            return EXIT_INPUT_MISSING
 
         print(f"[Directory mode] Found {total} ESM file(s) in: {in_path}")
         for i, esm_p in enumerate(esm_files):
@@ -848,7 +917,7 @@ def main():
 
     else:
         print(f"Error: '{in_path}' is neither a file nor a directory.")
-        return
+        return EXIT_INPUT_MISSING
 
     if args.log_file:
         log_path = os.path.abspath(args.log_file)
@@ -868,5 +937,7 @@ def main():
     print(f"  Result  →  OK: {ok}  |  Header only: {header}  |  No strings: {no_str}  |  Error: {errors}")
     print(f"{'=' * 60}")
 
+    return EXIT_SUCCESS if errors == 0 else EXIT_INTERNAL_ERROR
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

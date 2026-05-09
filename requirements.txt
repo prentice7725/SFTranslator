@@ -1,0 +1,9 @@
+PyQt6
+requests
+json-repair
+python-dotenv
+
+# Optional LLM providers. Install the one that matches config.json.
+google-cloud-aiplatform
+google-generativeai
+openai

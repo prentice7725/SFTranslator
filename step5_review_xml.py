@@ -8,6 +8,20 @@ import xml.etree.ElementTree as ET
 import json, re, time, logging, signal, sys, argparse
 from llm_backend import get_llm_backend
 from typing import List, Tuple, Dict, Optional
+from pipeline_runner import (
+    EXIT_ARGUMENT_ERROR,
+    EXIT_INPUT_MISSING,
+    EXIT_INTERNAL_ERROR,
+    EXIT_SUCCESS,
+    ensure_parent,
+    print_ok,
+    require_file,
+)
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 
@@ -155,24 +169,48 @@ def translate_batch_llm(needs: List[Tuple[str, str]], backend) -> List[str]:
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser("Step 5 리서치 및 선택 번역")
-    parser.add_argument("-i", "--input", required=True, help="입력 XML")
-    parser.add_argument("-o", "--output", default="postprocess_final.xml", help="출력 XML")
+    parser.add_argument("--mode", choices=["xml", "step2"], default="xml", help="실행 모드 분리")
+    parser.add_argument("--input-xml", dest="input_xml", default=None, help="Standardized input XML path")
+    parser.add_argument("--output-xml", dest="output_xml", default=None, help="Standardized reviewed XML output path")
+    parser.add_argument("--input-json", dest="input_json", default=None, help="Step2 translated JSON")
+    parser.add_argument("--output-json", dest="output_json", default=None, help="Step2 reviewed JSON")
+    parser.add_argument("--tone-profile", dest="tone_profile", default=None, help="Audio Tone Profile JSON")
+    parser.add_argument("--scan-output", dest="scan_output", default=None, help="Standardized scan JSON output path")
+    parser.add_argument("-i", "--input", required=False, help="입력 (XML or JSON)")
+    parser.add_argument("-o", "--output", default=None, help="출력 (XML or JSON)")
     parser.add_argument("--scan-only", action="store_true", help="미번역/오류 항목 스캔 후 JSON 출력")
     parser.add_argument("--translate-indices", help="번역할 항목의 인덱스 리스트 (쉼표 구분)")
     args = parser.parse_args()
 
-    input_path = Path(args.input)
-    if not input_path.exists():
-        log.error(f"Error: File not found {args.input}")
-        return
+    if args.mode == "step2":
+        return review_step2_json(args)
+
+    args.input = args.input_xml or args.input
+    args.output = args.output_xml or args.output or "postprocess_final.xml"
+    if not args.input:
+        print("Error: --input-xml is required.", file=sys.stderr)
+        return EXIT_ARGUMENT_ERROR
+
+    try:
+        input_path = require_file(args.input, "input XML")
+    except FileNotFoundError as exc:
+        log.error(f"Error: {exc}")
+        return EXIT_INPUT_MISSING
+
+    output_path = ensure_parent(args.output)
+    # The scan JSON intentionally lives beside the reviewed XML so GUI/manual
+    # follow-up work can reuse the same findings without reparsing logs.
+    scan_result_path = ensure_parent(args.scan_output) if args.scan_output else input_path.parent / "step5_scan_results.json"
 
     try:
         tree = ET.parse(str(input_path))
         root = tree.getroot()
     except Exception as e:
         log.error(f"Error: XML Parse fail {e}")
-        return
+        return EXIT_INTERNAL_ERROR
 
+    # Build one flat issue list first; later branches can either export it
+    # directly or use selected indices for a focused retry pass.
     # 전수 조사 (스캔)
     all_items = []
     strings = root.findall(".//String")
@@ -213,19 +251,22 @@ def main():
                 "dest": dst_val
             })
 
+    # Scan mode exits without mutating the XML.
     # --scan-only 모드: JSON 결과만 출력하고 종료
     if args.scan_only:
-        scan_result_path = input_path.parent / "step5_scan_results.json"
         with open(scan_result_path, "w", encoding="utf-8") as f:
             json.dump(all_items, f, ensure_ascii=False, indent=2)
         log.info(f"SCAN_COMPLETE: {len(all_items)} items found. Saved to {scan_result_path.name}")
-        return
+        print_ok(scan_result_path)
+        return EXIT_SUCCESS
 
     # --translate-indices 모드: 지정된 인덱스만 번역 실행
     if args.translate_indices:
         target_indices = [int(x.strip()) for x in args.translate_indices.split(",") if x.strip()]
         log.info(f"번역 시작: 총 {len(target_indices)}개 항목 선택됨.")
 
+        # Step 5 is incremental by design: only the selected indices are retried,
+        # everything else stays untouched in the current XML.
         # LLM 백엔드 초기화
         try:
             cfg_for_llm = {}
@@ -237,7 +278,7 @@ def main():
                                       retry_base_wait=Config.RETRY_BASE_WAIT)
         except Exception as e:
             log.error(f"LLM 초기화 실패: {e}")
-            return
+            return EXIT_INTERNAL_ERROR
 
         rag = DBRAG()
         
@@ -273,8 +314,142 @@ def main():
             time.sleep(Config.RPM_DELAY)
 
         # 결과 저장
-        tree.write(args.output, encoding="utf-8", xml_declaration=True)
-        log.info(f"번역 완료! 저장됨: {args.output}")
+        tree.write(str(output_path), encoding="utf-8", xml_declaration=True)
+        with open(scan_result_path, "w", encoding="utf-8") as f:
+            json.dump(all_items, f, ensure_ascii=False, indent=2)
+        log.info(f"번역 완료! 저장됨: {output_path}")
+        print_ok(output_path)
+        return EXIT_SUCCESS
+
+    with open(scan_result_path, "w", encoding="utf-8") as f:
+        json.dump(all_items, f, ensure_ascii=False, indent=2)
+    tree.write(str(output_path), encoding="utf-8", xml_declaration=True)
+    log.info(f"Scan complete. Reviewed XML saved to {output_path}")
+    print_ok(output_path)
+    return EXIT_SUCCESS
+
+def review_step2_json(args) -> int:
+    input_path = args.input_json or args.input
+    output_path = args.output_json or args.output
+    if not input_path:
+        log.error("Error: --input-json is required for mode step2")
+        return EXIT_ARGUMENT_ERROR
+        
+    try:
+        input_file = require_file(input_path, "input JSON")
+    except FileNotFoundError as e:
+        log.error(str(e))
+        return EXIT_INPUT_MISSING
+        
+    out_file = ensure_parent(output_path) if output_path else input_file.parent / "mod.step2.reviewed.json"
+    scan_file = ensure_parent(args.scan_output) if args.scan_output else input_file.parent / "mod.step2.scan.json"
+    
+    with open(input_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+        
+    tone_profiles = {}
+    if args.tone_profile:
+        try:
+            with open(args.tone_profile, "r", encoding="utf-8") as f:
+                tp_data = json.load(f)
+                tone_profiles = tp_data.get("speakers", {})
+        except Exception as e:
+            log.warning(f"Tone profile 로드 실패: {e}")
+            
+    # LLM 초기화 ("review" 역할 명시)
+    try:
+        cfg = {}
+        if CONFIG_PATH.exists():
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        backend = get_llm_backend(cfg, "step4_prompt", role="review", max_retries=Config.MAX_RETRIES, retry_base_wait=Config.RETRY_BASE_WAIT)
+    except Exception as e:
+        log.error(f"LLM 초기화 실패: {e}")
+        return EXIT_INTERNAL_ERROR
+
+    # 퀘스트/배치 리스트 구조 대응
+    quests = data if isinstance(data, list) else data.get("Quests", [])
+    
+    scan_report = {"total": 0, "reviewed": 0, "untranslated_fixed": 0, "tag_errors_fixed": 0, "items": []}
+    
+    # 계층 구조 순회용 도우미 함수
+    def process_dialogue_list(dialogues):
+        for item in dialogues:
+            src = item.get("Text", "")
+            dst = item.get("Translate", "")
+            speaker = item.get("Speaker", "Unknown")
+            string_id = item.get("StringID", "0")
+            
+            if not src: continue
+            scan_report["total"] += 1
+            
+            needs_review = False
+            issue_type = ""
+            if is_untranslated(src, dst):
+                needs_review = True
+                issue_type = "untranslated"
+            else:
+                tag_err = check_tag_integrity(src, dst)
+                if tag_err:
+                    needs_review = True
+                    issue_type = "tag_error"
+                    
+            if needs_review:
+                tone = tone_profiles.get(speaker, {})
+                tone_desc = json.dumps(tone, ensure_ascii=False) if tone else "기본(격식)"
+                
+                prompt = (f"아래 대사를 번역/교정하세요. 구조 보존을 최우선으로 하세요. 오직 교정된 한국어 번역만 답변하세요.\n"
+                          f"원문: {src}\n"
+                          f"번역: {dst}\n"
+                          f"화자 톤 가이드: {tone_desc}")
+                
+                try:
+                    res = backend.generate_content(prompt, temperature=0.2)
+                    fixed = " ".join(res.split()) if res else dst
+                    if fixed and fixed != dst:
+                        item["Translate"] = fixed
+                        scan_report["reviewed"] += 1
+                        if issue_type == "untranslated": scan_report["untranslated_fixed"] += 1
+                        else: scan_report["tag_errors_fixed"] += 1
+                        
+                        scan_report["items"].append({
+                            "string_id": string_id,
+                            "speaker": speaker,
+                            "issue": issue_type,
+                            "original": src,
+                            "fixed": fixed
+                        })
+                except Exception as e:
+                    log.warning(f"교정 실패 ({string_id}): {e}")
+            
+            # 선택지(Choices)도 처리
+            if "PlayerChoices" in item:
+                process_dialogue_list(item["PlayerChoices"])
+
+    for quest in quests:
+        if not isinstance(quest, dict): continue
+        # 1. Scenes 내부 순회
+        for scene in quest.get("Scenes", []):
+            for dial in scene.get("Dials", []):
+                process_dialogue_list(dial.get("Dialogues", []))
+        
+        # 2. StandaloneDials 순회
+        for dial in quest.get("StandaloneDials", []):
+            process_dialogue_list(dial.get("Dialogues", []))
+                    
+    with open(out_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    
+    with open(scan_file, "w", encoding="utf-8") as f:
+        json.dump(scan_report, f, ensure_ascii=False, indent=2)
+        
+    log.info(f"Step2 Review 완료: 총 교정 {scan_report['reviewed']}건. {out_file.name}")
+    print_ok(out_file)
+    return EXIT_SUCCESS
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(EXIT_INTERNAL_ERROR)

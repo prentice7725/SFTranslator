@@ -10,8 +10,27 @@ import os
 import time
 import logging
 import json
+import random
+from typing import Dict, Any, List, Optional, Union
+from dotenv import load_dotenv
+
+# .env 파일 로드
+load_dotenv()
 
 log = logging.getLogger("LLMBackend")
+
+ROLE_KEY_MAP = {
+    "audio_profile": "models.audio_profile",
+    "translation":   "models.translation",
+    "review":        "models.review",
+}
+
+def get_model_for_role(config: dict, role: str) -> str:
+    """role = 'audio_profile' | 'translation' | 'review'"""
+    if "models" in config and role in config["models"]:
+        return config["models"][role]
+    # 폴백: 기존 model_name 사용
+    return config.get("model_name", "gemini-2.5-flash")
 
 class CostTracker:
     """
@@ -380,6 +399,201 @@ class LocalLLMBackend(BaseLLMBackend):
             return None
         return None
 
+import requests
+
+class Min1AIBackend(BaseLLMBackend):
+    _RETRY_KEYWORDS = ('429', 'rate_limit_exceeded', '500', '503', 'timeout', 'internal_error')
+    total_used_credit = 0  # 세션 내 누적 크레딧 추적
+
+    def __init__(self, api_key, model_name, system_instruction, max_retries=5, retry_base_wait=60):
+        super().__init__(model_name, system_instruction, max_retries, retry_base_wait)
+        self.api_key = api_key
+        self.base_url = "https://api.1min.ai/api/chat-with-ai"
+        self.headers = {
+            "Content-Type": "application/json",
+            "API-KEY": self.api_key
+        }
+
+    def _extract_text_response(self, data: Dict[str, Any]) -> str:
+        """1min.ai Unified API 응답 구조에서 텍스트 내용을 추출합니다."""
+        # Unified API 구조: data["aiRecord"]["aiRecordDetail"]["resultObject"] -> List[str]
+        ai_record = data.get("aiRecord", {})
+        detail = ai_record.get("aiRecordDetail", {})
+        result_obj = detail.get("resultObject", [])
+
+        if isinstance(result_obj, list) and len(result_obj) > 0:
+            return result_obj[0]
+            
+        # 심의(검열) 걸리는 경우 resultObject가 dict 형태로 반환됨
+        if isinstance(result_obj, dict) and "code" in result_obj:
+            error_msg = f"1min.ai API Error [{result_obj.get('code')}]: {result_obj.get('message')}"
+            raise RuntimeError(error_msg)
+        
+        # 폴백: 하위 호환성 유지 (혹시라도 responseObject가 올 경우)
+        response_obj = detail.get("responseObject", {})
+        if isinstance(response_obj, str):
+            return response_obj
+        if isinstance(response_obj, dict):
+            return response_obj.get("content") or response_obj.get("text") or ""
+
+        if "result" in data and data["result"]:
+            return data["result"]
+            
+        return ""
+
+    def generate_content(self, prompt: str, temperature=0.3, max_output_tokens=8192) -> str | None:
+        # 사용자 제안 반영: system 지침을 별도 필드로 분리하여 500 에러 방지 시도
+        payload = {
+            "type": "UNIFY_CHAT_WITH_AI",
+            "model": self.model_name,
+            "promptObject": {
+                "prompt": prompt,
+                "system": self.system_instruction,
+                "settings": {
+                    "historySettings": {"isMixed": False},
+                    "webSearchSettings": {"webSearch": False}
+                }
+            }
+        }
+        
+        # URL에 non-streaming 명시
+        target_url = f"{self.base_url}?isStreaming=false"
+        
+        last_exc = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = requests.post(target_url, headers=self.headers, json=payload, timeout=120)
+                
+                if response.status_code == 429:
+                    wait = min(2 ** attempt + random.random() * 5, 30)
+                    log.warning(f"1min.ai Rate Limit (429) 감지. {wait:.1f}초 대기 후 재시도...")
+                    time.sleep(wait)
+                    continue
+                    
+                response.raise_for_status()
+                data = response.json()
+                
+                # 크레딧 정보 추출 (사용자 요청 반영: usedCredit, creditLimit 등 상세 정보 로깅)
+                metadata = data.get("metadata", {})
+                batch_credit = metadata.get("credit", 0)
+                
+                ai_record = data.get("aiRecord", {})
+                team_user = ai_record.get("teamUser", {})
+                remaining_credit = team_user.get("creditLimit", 0) - team_user.get("usedCredit", 0)
+
+                Min1AIBackend.total_used_credit += batch_credit
+                log.info(f"[1min.ai] Model: {self.model_name} | 소모: {batch_credit} | 남은 잔액: {remaining_credit} | 세션 누적: {Min1AIBackend.total_used_credit}")
+
+                # 프로세스 간 크레딧 공유를 위해 파일에 기록
+                try:
+                    session_file = "session_credits.json"
+                    current_total = 0
+                    if os.path.exists(session_file):
+                        with open(session_file, "r", encoding="utf-8") as f:
+                            current_total = json.load(f).get("total", 0)
+                    with open(session_file, "w", encoding="utf-8") as f:
+                        json.dump({"total": current_total + batch_credit}, f)
+                except:
+                    pass
+
+                # 최종 텍스트 추출
+                content = self._extract_text_response(data)
+                
+                if not content:
+                    log.warning(f"1min.ai 응답 내용이 비어 있습니다. (시도 {attempt})")
+                    log.error(f"🔍 1min.ai 원시 응답(Raw Response): {json.dumps(data, ensure_ascii=False)}")
+                    raise ValueError("EMPTY_RESPONSE")
+                
+                return content
+                
+            except Exception as e:
+                # 400/500 에러 시 어떤 모델에서 문제가 생겼는지 명시
+                if hasattr(e, 'response') and e.response is not None:
+                    try:
+                        err_body = e.response.json()
+                        log.error(f"1min.ai API 상세 에러 (HTTP {e.response.status_code}) [Model: {self.model_name}]: {err_body}")
+                    except:
+                        log.error(f"1min.ai API 상세 에러 (HTTP {e.response.status_code}) [Model: {self.model_name}]: {e.response.text}")
+                
+                # 재시도 조건 판별
+                err_str = str(e).lower()
+                last_exc = e
+                retry_cond = any(kw in err_str for kw in self._RETRY_KEYWORDS) or (hasattr(e, 'response') and e.response is not None and e.response.status_code in [500, 502, 503, 504])
+                
+                if retry_cond:
+                    # 500 에러는 짧게(10~15초), 429/기타는 지수 백오프 유지
+                    is_500 = hasattr(e, 'response') and e.response is not None and e.response.status_code == 500
+                    if is_500:
+                        wait = 10 + (random.random() * 5)
+                    else:
+                        wait = self.retry_base_wait * (2 ** (attempt - 1)) + (random.random() * 2)
+                    
+                    log.warning(f"1min.ai 일시적 오류 (시도 {attempt}) [Model: {self.model_name}], {wait:.1f}초 대기 후 재시도: {str(e)[:100]}")
+                    time.sleep(wait)
+                    continue
+                else:
+                    raise e
+                    
+        if last_exc: 
+            log.error("1min.ai 최대 재시도 횟수 초과. 스킵합니다.")
+            return None
+        return None
+
+    def _upload_file(self, file_path: str) -> Dict[str, Any] | None:
+        """1min.ai 서버에 파일을 업로드하고 메타데이터를 반환합니다."""
+        upload_url = "https://api.1min.ai/api/files/upload?isFullData=true"
+        try:
+            with open(file_path, "rb") as f:
+                files = {"file": f}
+                response = requests.post(upload_url, headers={"API-KEY": self.api_key}, files=files)
+                response.raise_for_status()
+                return response.json()
+        except Exception as e:
+            log.error(f"1min.ai file upload failed: {e}")
+            return None
+
+    def generate_with_audio(self, prompt: str, audio_path: str) -> str | None:
+        """오디오 파일을 첨부하여 1min.ai에 분석 요청을 보냅니다."""
+        # 1. 파일 업로드
+        file_info = self._upload_file(audio_path)
+        if not file_info:
+            return None
+        
+        # 2. 업로드된 파일 정보를 포함하여 채팅 요청
+        payload = {
+            "type": "UNIFY_CHAT_WITH_AI",
+            "model": self.model_name,
+            "promptObject": {
+                "prompt": prompt,
+                "system": self.system_instruction,
+                "settings": {
+                    "historySettings": {"isMixed": False},
+                    "webSearchSettings": {"webSearch": False}
+                },
+                "attachments": {
+                    "files": [
+                        {
+                            "id": file_info.get("uuid"),
+                            "name": file_info.get("name"),
+                            "type": file_info.get("type"),
+                            "url": file_info.get("url")
+                        }
+                    ],
+                    "images": []
+                }
+            }
+        }
+        
+        target_url = f"{self.base_url}?isStreaming=false"
+        try:
+            response = requests.post(target_url, headers=self.headers, json=payload, timeout=180)
+            response.raise_for_status()
+            data = response.json()
+            return self._extract_text_response(data)
+        except Exception as e:
+            log.error(f"1min.ai generate_with_audio failed: {e}")
+            return None
+
 def _deobfuscate(text: str) -> str:
     if not text: return text
     try:
@@ -391,35 +605,48 @@ def _deobfuscate(text: str) -> str:
     except:
         return text
 
-def get_llm_backend(config_dict, step_prompt_key, max_retries=3, retry_base_wait=60):
-    """
-    config.json 에 설정된 통신 프로바이더(`api_provider`) 값을 읽고, 
-    해당 설정에 맞는 백엔드 클래스(Vertex, Gemini, OpenAI, LocalLLM 중 하나) 인스턴스를 생성하여 반환합니다.
-    (비밀키는 간단한 XOR 난독화 처리를 통해 평문 노출을 최소화합니다)
-    """
-    provider = config_dict.get("api_provider", "vertexai")
-    model_name = config_dict.get("model_name", "gemini-2.5-flash")
+def get_llm_backend(config_dict, step_prompt_key, role=None, max_retries=3, retry_base_wait=60):
+    # 신규 'provider' 필드 우선, 없으면 기존 'api_provider' 사용
+    provider = config_dict.get("provider") or config_dict.get("api_provider", "vertexai")
+    
+    # [보강] vertexai_gemini 등의 별칭도 vertexai 공식 명칭으로 매핑
+    if str(provider).lower() in ["vertexai_gemini", "vertex_ai", "google", "vertexai"]:
+        provider = "vertexai"
+
+    # role이 주어지면 해당 역할에 맞는 모델 선택, 아니면 기본 model_name 사용
+    if role:
+        model_name = get_model_for_role(config_dict, role)
+    else:
+        model_name = config_dict.get("model_name", "gemini-2.5-flash")
+    
     system_instruction = config_dict.get(step_prompt_key, "")
     
     if provider == "vertexai":
-        project_id = config_dict.get("gcp_project_id", "")
-        location = config_dict.get("gcp_location", "asia-northeast1")
+        project_id = os.getenv("GCP_PROJECT_ID") or config_dict.get("gcp_project_id", "")
+        location = os.getenv("GCP_LOCATION") or config_dict.get("gcp_location", "asia-northeast1")
         
-        # 키 파일 경로가 config에 저장되어 있다면 환경변수로 즉시 등록
-        key_json_path = config_dict.get("gcp_key_json", "")
+        key_json_path = os.getenv("GCP_KEY_JSON") or config_dict.get("gcp_key_json", "")
         if key_json_path and os.path.exists(key_json_path):
             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_json_path
             
         return VertexBackend(project_id, location, model_name, system_instruction, max_retries, retry_base_wait)
     elif provider == "gemini":
-        api_key = _deobfuscate(config_dict.get("gemini_api_key", ""))
+        env_key = os.getenv("GEMINI_API_KEY")
+        api_key = _deobfuscate(env_key) if env_key else _deobfuscate(config_dict.get("gemini_api_key", ""))
         return GeminiBackend(api_key, model_name, system_instruction, max_retries, retry_base_wait)
     elif provider == "openai":
-        api_key = _deobfuscate(config_dict.get("openai_api_key", ""))
+        env_key = os.getenv("OPENAI_API_KEY")
+        api_key = _deobfuscate(env_key) if env_key else _deobfuscate(config_dict.get("openai_api_key", ""))
         return OpenAIBackend(api_key, model_name, system_instruction, max_retries, retry_base_wait)
     elif provider == "localllm":
-        base_url = config_dict.get("localllm_base_url", "http://localhost:11434/v1")
-        api_key = _deobfuscate(config_dict.get("localllm_api_key", ""))
+        base_url = os.getenv("LOCALL_LLM_BASE_URL") or config_dict.get("localllm_base_url", "http://localhost:11434/v1")
+        env_key = os.getenv("LOCALL_LLM_API_KEY")
+        api_key = _deobfuscate(env_key) if env_key else _deobfuscate(config_dict.get("localllm_api_key", ""))
         return LocalLLMBackend(base_url, api_key, model_name, system_instruction, max_retries, retry_base_wait)
+    elif provider == "1minai":
+        env_key = os.getenv("MIN1AI_API_KEY")
+        api_key = _deobfuscate(env_key) if env_key else _deobfuscate(config_dict.get("1minai_api_key", ""))
+        return Min1AIBackend(api_key, model_name, system_instruction, max_retries, retry_base_wait)
     else:
         raise ValueError(f"Unknown API provider: {provider}")
+

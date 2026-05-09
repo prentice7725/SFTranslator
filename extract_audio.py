@@ -121,6 +121,28 @@ def run_extraction(priority_list_path, data_dir, output_dir):
     with open(priority_list_path, "r", encoding="utf-8") as f:
         priority_list = json.load(f)
 
+    # 4. 데이터 형식 보정 (List of Quests vs Dict of Speakers)
+    if isinstance(priority_list, list):
+        print("  🔍 Detected Quest List format. Grouping speakers...")
+        grouped = {}
+        def _collect(dialogues):
+            for d in dialogues:
+                spk = d.get("Speaker", "Unknown")
+                path = d.get("AudioPath")
+                if spk and path:
+                    if spk not in grouped: grouped[spk] = []
+                    # 중복 방지
+                    if not any(x["AudioPath"] == path for x in grouped[spk]):
+                        grouped[spk].append({"AudioPath": path})
+        
+        for q in priority_list:
+            for s in q.get("Scenes", []):
+                for d in s.get("Dials", []):
+                    _collect(d.get("Dialogues", []))
+            for d in q.get("StandaloneDials", []):
+                _collect(d.get("Dialogues", []))
+        priority_list = grouped
+
     # BA2 Extractors cache
     extractors = {}
     
@@ -241,6 +263,7 @@ def run_extraction(priority_list_path, data_dir, output_dir):
 
 if __name__ == "__main__":
     import argparse
+    from pipeline_runner import print_ok
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--priority-list", default="priority_list.json")
     parser.add_argument("-d", "--data-dir", required=True, help="Starfield Data directory")
@@ -248,3 +271,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     run_extraction(args.priority_list, args.data_dir, args.output_dir)
+    print_ok(args.output_dir)
