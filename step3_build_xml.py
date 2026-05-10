@@ -11,6 +11,7 @@ from pipeline_runner import (
     EXIT_ARGUMENT_ERROR,
     EXIT_INPUT_MISSING,
     EXIT_INTERNAL_ERROR,
+    EXIT_OUTPUT_FAILURE,
     EXIT_SUCCESS,
     ensure_parent,
     print_ok,
@@ -127,6 +128,18 @@ def _translation_text(value) -> str | None:
     return value
 
 
+def _source_hash_matches(expected_hash: str, source_text: str) -> bool:
+    if not expected_hash:
+        return True
+    if source_hash(source_text) == expected_hash:
+        return True
+    # XML parsers normalize CRLF text nodes to LF, while the extraction hash is
+    # based on the original game string. Accept the original CRLF form too.
+    if "\n" in source_text and source_hash(source_text.replace("\n", "\r\n")) == expected_hash:
+        return True
+    return False
+
+
 def merge_json_into_xml(xml_path: str, translated_map: dict, output_xml: str):
     """
     기존 완성된 XML 파일을 읽어, JSON 번역 맵 기준으로 <Dest> 값만 업데이트합니다.
@@ -176,7 +189,7 @@ def merge_json_into_xml(xml_path: str, translated_map: dict, output_xml: str):
             skipped_count += 1
             continue
 
-        if expected_source_hash and expected_source_hash != actual_source_hash:
+        if not _source_hash_matches(expected_source_hash, source_text):
             errors.append({"stable_id": stable_id, "code": "source_hash_mismatch", "expected": expected_source_hash, "actual": actual_source_hash})
             continue
 
@@ -199,7 +212,7 @@ def merge_json_into_xml(xml_path: str, translated_map: dict, output_xml: str):
 
         trans = _translation_text(trans_entry)
         if trans is not None:
-            if isinstance(trans_entry, dict) and trans_entry.get("source_hash") and trans_entry["source_hash"] != actual_source_hash:
+            if isinstance(trans_entry, dict) and not _source_hash_matches(trans_entry.get("source_hash", ""), source_text):
                 errors.append({"stable_id": stable_id, "code": "translation_source_hash_mismatch"})
                 continue
             dest_node.text = sanitize_xml_chars(trans)

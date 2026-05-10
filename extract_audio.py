@@ -5,6 +5,22 @@ import zlib
 import shutil
 from pathlib import Path
 
+WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+}
+
+def safe_windows_dirname(name):
+    """Return a Windows-safe directory name while keeping it human-readable."""
+    safe = "".join("_" if ch in '<>:"/\\|?*' or ord(ch) < 32 else ch for ch in str(name))
+    safe = safe.strip().rstrip(".")
+    if not safe:
+        safe = "Unknown"
+    if safe.upper() in WINDOWS_RESERVED_NAMES:
+        safe = f"{safe}_"
+    return safe
+
 class BA2Extractor:
     def __init__(self, ba2_path):
         self.ba2_path = ba2_path
@@ -185,7 +201,10 @@ def run_extraction(priority_list_path, data_dir, output_dir):
 
     for speaker, samples in priority_list.items():
         print(f"Processing speaker: {speaker}")
-        speaker_dir = os.path.join(output_dir, speaker)
+        safe_speaker = safe_windows_dirname(speaker)
+        if safe_speaker != speaker:
+            print(f"  [INFO] Using Windows-safe folder name: {safe_speaker}")
+        speaker_dir = os.path.join(output_dir, safe_speaker)
         os.makedirs(speaker_dir, exist_ok=True)
         
         for sample in samples:
