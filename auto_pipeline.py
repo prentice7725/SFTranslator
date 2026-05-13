@@ -7,9 +7,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from enum import Enum
-import sys
-from datetime import datetime
-from pathlib import Path
 
 from pipeline_runner import (
     EXIT_ARGUMENT_ERROR,

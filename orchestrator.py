@@ -2,6 +2,8 @@ import json
 import logging
 import os
 import hashlib
+import re
+import threading
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -28,6 +30,7 @@ class TranslationCache:
     def __init__(self, cache_file="translation_cache.json"):
         self.cache_file = cache_file
         self.cache = {}
+        self._lock = threading.RLock()
         if os.path.exists(cache_file):
             try:
                 with open(cache_file, "r", encoding="utf-8") as f:
@@ -42,17 +45,20 @@ class TranslationCache:
 
     def get(self, model_name, system_instruction, prompt):
         key = self.get_key(model_name, system_instruction, prompt)
-        return self.cache.get(key)
+        with self._lock:
+            return self.cache.get(key)
 
     def set(self, model_name, system_instruction, prompt, result):
         key = self.get_key(model_name, system_instruction, prompt)
-        self.cache[key] = result
-        self._save()
+        with self._lock:
+            self.cache[key] = result
+            self._save()
 
     def _save(self):
         try:
-            with open(self.cache_file, "w", encoding="utf-8") as f:
-                json.dump(self.cache, f, ensure_ascii=False, indent=2)
+            with self._lock:
+                with open(self.cache_file, "w", encoding="utf-8") as f:
+                    json.dump(self.cache, f, ensure_ascii=False, indent=2)
         except Exception as e:
             log.warning(f"캐시 저장 실패: {e}")
 
@@ -60,7 +66,7 @@ class TranslationOrchestrator:
     """
     다중 모델을 활용하여 번역 후보를 생성하고, 최종 감수 모델을 통해 최적의 번역본을 도출합니다.
     """
-    def __init__(self, gen_backends, review_backend, glossary_text="", cache_enabled=True, work_dir=None):
+    def __init__(self, gen_backends, review_backend, glossary_text="", cache_enabled=True, work_dir=None, review_skip_similarity=0.85):
         """
         gen_backends: 후보 생성을 담당할 백엔드 리스트 (각기 다른 페르소나 설정 권장)
         review_backend: 최종 감수 및 확정을 담당할 고성능 백엔드
@@ -71,6 +77,7 @@ class TranslationOrchestrator:
         self.review_backend = review_backend
         self.glossary_text = glossary_text
         self.work_dir = Path(work_dir) if work_dir else Path(".")
+        self.review_skip_similarity = review_skip_similarity
         
         # 캐시 파일도 모드별 폴더에 생성하도록 변경
         cache_file = self.work_dir / "translation_cache.json"
@@ -105,7 +112,27 @@ class TranslationOrchestrator:
             self.cache.set(backend.model_name, backend.system_instruction, prompt, result)
         return result
 
-    def translate_with_review(self, prompt_body, context_info="", char_profile=""):
+    @staticmethod
+    def _candidate_similarity(left, right):
+        left_tokens = set(re.findall(r"[\w가-힣]+", str(left).lower()))
+        right_tokens = set(re.findall(r"[\w가-힣]+", str(right).lower()))
+        if not left_tokens and not right_tokens:
+            return 1.0
+        if not left_tokens or not right_tokens:
+            return 0.0
+        return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+    def _can_skip_review(self, candidates):
+        if len(candidates) < 2 or self.review_skip_similarity <= 0:
+            return False
+        scores = [
+            self._candidate_similarity(candidates[i], candidates[j])
+            for i in range(len(candidates))
+            for j in range(i + 1, len(candidates))
+        ]
+        return bool(scores) and min(scores) >= self.review_skip_similarity
+
+    def translate_with_review(self, prompt_body, context_info="", char_profile="", glossary_text=None):
         """
         1단계: 여러 모델로부터 번역 후보 수집 (병렬 처리)
         2단계: 감수 모델이 후보들을 비교/검토하여 최종 결과 도출
@@ -130,8 +157,13 @@ class TranslationOrchestrator:
             log.warning("생성된 번역 후보가 없습니다. 기본 감수 모델로 단독 번역을 시도합니다.")
             return self._cached_generate(self.review_backend, prompt_body)
 
+        if self._can_skip_review(candidates):
+            log.info(f"후보 유사도가 {self.review_skip_similarity:.2f} 이상이라 감수 호출을 생략합니다.")
+            self._log_orchestration(prompt_body, candidates, candidates[0], context_info, char_profile)
+            return candidates[0]
+
         # 2. 최종 감수 (Senior Editor)
-        review_prompt = self._build_review_prompt(prompt_body, candidates, context_info, char_profile)
+        review_prompt = self._build_review_prompt(prompt_body, candidates, context_info, char_profile, glossary_text=glossary_text)
         final_result = self._cached_generate(self.review_backend, review_prompt)
         
         # 에디터의 판단 과정 로깅
@@ -169,8 +201,9 @@ class TranslationOrchestrator:
         except Exception as e:
             log.warning(f"오케스트레이션 로그 저장 실패: {e}")
 
-    def _build_review_prompt(self, original_prompt, candidates, context_info, char_profile):
+    def _build_review_prompt(self, original_prompt, candidates, context_info, char_profile, glossary_text=None):
         candidate_blocks = "\n\n".join([f"--- [후보 {i+1}] ---\n{c}" for i, c in enumerate(candidates)])
+        scoped_glossary = glossary_text if glossary_text is not None else self.glossary_text
         
         instructions = f"""
 당신은 AAA급 게임 로컬라이제이션 프로젝트를 총괄하는 **수석 에디터(Senior Localization Editor)**입니다.
@@ -222,7 +255,7 @@ class TranslationOrchestrator:
 {context_info}
 
 [용어집]
-{self.glossary_text}
+{scoped_glossary}
 
 [생성된 번역 후보들]
 {candidate_blocks}

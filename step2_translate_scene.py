@@ -1,4 +1,5 @@
 import collections
+import copy
 import hashlib
 import json
 import logging
@@ -8,6 +9,7 @@ import re
 import signal
 import sys
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import json_repair
 from pipeline_runner import (
@@ -66,6 +68,30 @@ def signal_handler(sig, frame):
     b_stop_requested = True
 
 signal.signal(signal.SIGINT, signal_handler)
+
+
+def apply_translation_memory_hit(item: dict, text: str, rag, mod_stem: str, subrecord_path: str) -> bool:
+    """완전 일치 TM이 있으면 LLM 큐에 넣지 않고 즉시 번역을 채운다."""
+    if not rag or not hasattr(rag, "find_exact"):
+        return False
+    hit = rag.find_exact(text)
+    if not hit:
+        return False
+
+    add_item_contract(
+        item,
+        plugin_name=mod_stem,
+        record_type=item.get("record_type", "INFO"),
+        subrecord_path=item.get("subrecord_path", subrecord_path),
+    )
+    item["Translate"] = hit
+    item["translation"] = hit
+    item["model"] = "translation_memory"
+    item.setdefault("chunk_id", "tm_exact")
+    item["risk_flags"] = risk_flags(str(text or ""), str(hit or ""), item)
+    item.setdefault("glossary_hits", [])
+    item["translation_class"] = "TM_EXACT"
+    return True
 
 # DB 및 RAG 로드 (프로젝트 내 db_manager.py 필요)
 try:
@@ -224,6 +250,12 @@ def profile_scene(quest_data: dict, backend, use_ja_ref: bool = False, mod_stem:
 def build_scene_prompt(chunk_items, mod_stem, context_lines, scene_profile, glossary_text, rag, tone_profiles):
     dialogue_blocks = []
     id_map = {}
+    active_speakers = {
+        str(item.get("Speaker", "Unknown"))
+        for item in list(chunk_items) + list(context_lines)
+        if item.get("Speaker")
+    }
+    scoped_glossary_text = filter_glossary_for_prompt(glossary_text, chunk_items, context_lines)
 
     profile_text = ""
     if scene_profile:
@@ -231,14 +263,17 @@ def build_scene_prompt(chunk_items, mod_stem, context_lines, scene_profile, glos
     char_guides = scene_profile.get("character_guidelines", {})
     if isinstance(char_guides, dict):
         for spk, guide in char_guides.items():
+            if spk not in active_speakers:
+                continue
             # [음성 분석 결과 우선 적용]
-            tone_guide = tone_profiles.get(spk)
+            tone_guide = compact_tone_profile(tone_profiles, spk)
             final_guide = f"[음성 분석 가이드] {tone_guide}" if tone_guide else guide
             profile_text += f"- {spk}: {final_guide}\n"
 
     dialogue_blocks.append("--- [이전 문맥] ---")
     for ctx in context_lines:
-        dialogue_blocks.append(f"[{ctx.get('Speaker')}] {ctx.get('Text')}")
+        source = ctx.get("_context_source") or "최근 문맥"
+        dialogue_blocks.append(f"[{source} / {ctx.get('Speaker')}] {ctx.get('Text')}")
 
     dialogue_blocks.append("\n--- [번역 대상] ---")
     for i, item in enumerate(chunk_items):
@@ -261,7 +296,7 @@ def build_scene_prompt(chunk_items, mod_stem, context_lines, scene_profile, glos
 [치명적 지시]
 1. NPC는 지정된 말투를 끝까지 고수할 것. 
 2. 단, 'Player'는 상대와 상황에 따라 말투를 유연하게 바꿀 것.
-3. 용어집 준수: {glossary_text}
+3. 용어집 준수: {scoped_glossary_text if scoped_glossary_text else "(이번 청크에 직접 등장하는 용어집 항목 없음)"}
 4. 무조건 아래 JSON 형식으로만 응답할 것. 추가적인 부연 설명은 절대 금지. (BatchID 키는 B0, B1 등 원문에서 주어진 식별자를 그대로 사용하세요)
 {{
   "B0": "번역문 0",
@@ -269,6 +304,45 @@ def build_scene_prompt(chunk_items, mod_stem, context_lines, scene_profile, glos
 }}
 """
     return instructions + "\n\n" + "\n".join(dialogue_blocks), id_map
+
+
+def compact_tone_profile(tone_profiles: dict, speaker: str) -> str:
+    if not tone_profiles:
+        return ""
+    profiles = tone_profiles.get("speakers", tone_profiles) if isinstance(tone_profiles, dict) else {}
+    profile = profiles.get(speaker) if isinstance(profiles, dict) else None
+    if not profile:
+        return ""
+    if isinstance(profile, str):
+        return profile[:600]
+    if not isinstance(profile, dict):
+        return str(profile)[:600]
+
+    keep = {}
+    for key in ("tone", "gender", "age_group", "speech_style", "honorific_level", "confidence"):
+        if key in profile:
+            keep[key] = profile[key]
+
+    acoustic = profile.get("acoustic_features")
+    if isinstance(acoustic, dict):
+        acoustic_keep = {}
+        for key in (
+            "sample_count",
+            "f0_mean_hz_mean",
+            "f0_std_hz_mean",
+            "rms_mean",
+            "spectral_centroid_hz_mean",
+            "onset_rate_per_sec_mean",
+            "approx_tokens_per_sec_mean",
+        ):
+            if key in acoustic:
+                acoustic_keep[key] = acoustic[key]
+        if acoustic_keep:
+            keep["acoustic_features"] = acoustic_keep
+
+    if not keep:
+        return ""
+    return json.dumps(keep, ensure_ascii=False, separators=(",", ":"))
 
 def translate_scene_recursive(chunk_items, backend, mod_stem, context_lines, scene_profile, glossary_text, rag, tone_profiles, depth=0, orchestration_backend=None, risk_report=None):
     if not chunk_items or depth > 5 or b_stop_requested:
@@ -281,16 +355,29 @@ def translate_scene_recursive(chunk_items, backend, mod_stem, context_lines, sce
 
         char_profile_info = ""
         context_info = ""
+        scoped_glossary_text = filter_glossary_for_prompt(glossary_text, chunk_items, context_lines)
         if isinstance(backend, TranslationOrchestrator) or orchestration_backend:
+            active_speakers = {
+                str(item.get("Speaker", "Unknown"))
+                for item in list(chunk_items) + list(context_lines)
+                if item.get("Speaker")
+            }
             char_profile_info = f"씬 분위기: {scene_profile.get('scene_mood', '')}\n"
             for spk, guide in scene_profile.get("character_guidelines", {}).items():
+                if spk not in active_speakers:
+                    continue
                 char_profile_info += f"- {spk}: {guide}\n"
             for ctx in context_lines:
                 context_info += f"[{ctx.get('Speaker')}] {ctx.get('Text')}\n"
 
         def generate_with(selected_backend):
             if isinstance(selected_backend, TranslationOrchestrator):
-                return selected_backend.translate_with_review(prompt, context_info=context_info, char_profile=char_profile_info)
+                return selected_backend.translate_with_review(
+                    prompt,
+                    context_info=context_info,
+                    char_profile=char_profile_info,
+                    glossary_text=scoped_glossary_text,
+                )
             return selected_backend.generate_content(prompt)
 
         raw = generate_with(backend)
@@ -353,6 +440,207 @@ def translate_scene_recursive(chunk_items, backend, mod_stem, context_lines, sce
             mid = len(chunk_items) // 2
             translate_scene_recursive(chunk_items[:mid], backend, mod_stem, context_lines, scene_profile, glossary_text, rag, tone_profiles, depth + 1, orchestration_backend, risk_report)
             translate_scene_recursive(chunk_items[mid:], backend, mod_stem, chunk_items[:mid], scene_profile, glossary_text, rag, tone_profiles, depth + 1, orchestration_backend, risk_report)
+
+
+def build_quest_translation_items(quest: dict, rag, mod_stem: str) -> list[dict]:
+    dial_flat_list = []
+
+    for s in quest.get("Scenes", []):
+        for d in s.get("Dials", []):
+            for dial in d.get("Dialogues", []):
+                txt = dial.get("Text")
+                field_type = dial.get("FieldType") or dial.get("subrecord_path") or "NAM1"
+                if txt:
+                    if dial.get("Translate"):
+                        pass
+                    elif is_only_tags_and_punct(txt):
+                        dial["Translate"] = txt
+                    elif apply_translation_memory_hit(dial, txt, rag, mod_stem, field_type):
+                        pass
+                    else:
+                        add_item_contract(dial, plugin_name=mod_stem, record_type=dial.get("record_type", "INFO"), subrecord_path=dial.get("subrecord_path", field_type))
+                        dial_flat_list.append(dial)
+                for choice in dial.get("PlayerChoices", []):
+                    ctxt = choice.get("Text")
+                    if ctxt:
+                        if choice.get("Translate"):
+                            pass
+                        elif is_only_tags_and_punct(ctxt):
+                            choice["Translate"] = ctxt
+                        elif apply_translation_memory_hit(choice, ctxt, rag, mod_stem, "CHOICE"):
+                            pass
+                        else:
+                            add_item_contract(choice, plugin_name=mod_stem, record_type=choice.get("record_type", "INFO"), subrecord_path=choice.get("subrecord_path", "CHOICE"))
+                            dial_flat_list.append(choice)
+
+    for dial in quest.get("StandaloneDials", []):
+        for d in dial.get("Dialogues", []):
+            txt = d.get("Text")
+            field_type = d.get("FieldType") or d.get("subrecord_path") or "NAM1"
+            if txt:
+                if d.get("Translate"):
+                    pass
+                elif is_only_tags_and_punct(txt):
+                    d["Translate"] = txt
+                elif apply_translation_memory_hit(d, txt, rag, mod_stem, field_type):
+                    pass
+                else:
+                    add_item_contract(d, plugin_name=mod_stem, record_type=d.get("record_type", "INFO"), subrecord_path=d.get("subrecord_path", field_type))
+                    dial_flat_list.append(d)
+            for choice in d.get("PlayerChoices", []):
+                ctxt = choice.get("Text")
+                if ctxt:
+                    if choice.get("Translate"):
+                        pass
+                    elif is_only_tags_and_punct(ctxt):
+                        choice["Translate"] = ctxt
+                    elif apply_translation_memory_hit(choice, ctxt, rag, mod_stem, "CHOICE"):
+                        pass
+                    else:
+                        add_item_contract(choice, plugin_name=mod_stem, record_type=choice.get("record_type", "INFO"), subrecord_path=choice.get("subrecord_path", "CHOICE"))
+                        dial_flat_list.append(choice)
+
+    return dial_flat_list
+
+
+def process_quest_translation(
+    quest: dict,
+    *,
+    config: dict,
+    mod_stem: str,
+    profile_backend,
+    backend,
+    orchestration_backend,
+    glossary_text: str,
+    tone_profiles: dict,
+    cached_profile: dict | None,
+    use_ja_ref: bool,
+    profile_only: bool,
+) -> dict:
+    if b_stop_requested:
+        return {"quest_id": quest.get("QuestID", "Unknown"), "quest": quest, "stopped": True, "profile": cached_profile or {}, "risk_report": [], "chunk_log": [], "chunk_count": 0}
+
+    rag = DBRAG()
+    q_id = quest.get("QuestID", "Unknown")
+    log.info(f"퀘스트 처리 중: {q_id}")
+
+    q_profile = cached_profile
+    if q_profile is None:
+        q_profile = profile_scene(quest, profile_backend, use_ja_ref, mod_stem, rag)
+
+    if profile_only:
+        rag.close()
+        return {"quest_id": q_id, "quest": quest, "profile": q_profile, "risk_report": [], "chunk_log": [], "chunk_count": 0}
+
+    dial_flat_list = build_quest_translation_items(quest, rag, mod_stem)
+    context_index = build_context_index(quest)
+    chunk_size = int(config.get("step2_chunk_size", config.get("chunk_size", 40)))
+    max_chunk_chars = int(config.get("step2_max_chunk_chars", 3500))
+    max_input_tokens = int(config.get("step2_max_input_tokens", 6000))
+    max_output_tokens = int(config.get("step2_max_output_tokens", 4000))
+    chunks = build_adaptive_chunks(dial_flat_list, chunk_size, max_chunk_chars, max_input_tokens + max_output_tokens)
+    recent_context = []
+    risk_report = []
+    chunk_log = []
+
+    num_chunks = len(chunks)
+    for i, chunk in enumerate(chunks):
+        if b_stop_requested:
+            break
+        chunk_id = f"{q_id}_chunk_{i + 1:03d}"
+        for item in chunk:
+            item["chunk_id"] = chunk_id
+        chunk_log.append(build_chunk_log_entry(chunk_id, chunk, str(config.get("model_name") or config.get("models", {}).get("translation", "fast_translation"))))
+        log.info(f"  -> [{q_id} 청크 {i+1}/{num_chunks}] {len(chunk)}개 대사 번역 중...")
+        prompt_context = build_pnam_context(chunk, recent_context, context_index)
+        translate_scene_recursive(chunk, backend, mod_stem, prompt_context, q_profile, glossary_text, rag, tone_profiles, orchestration_backend=orchestration_backend, risk_report=risk_report)
+        recent_context = chunk[-5:]
+
+    rag.close()
+    return {
+        "quest_id": q_id,
+        "quest": quest,
+        "profile": q_profile,
+        "risk_report": risk_report,
+        "chunk_log": chunk_log,
+        "chunk_count": len(chunks),
+        "stopped": b_stop_requested,
+    }
+
+
+def _normalize_form_id(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return f"{int(text, 16):08X}"
+    except ValueError:
+        return text.upper()
+
+
+def build_context_index(quest: dict) -> dict[str, dict]:
+    index = {}
+
+    def add_items(items):
+        for item in items:
+            form_id = _normalize_form_id(item.get("FormID") or item.get("form_id"))
+            if form_id:
+                index.setdefault(form_id, item)
+            for choice in item.get("PlayerChoices", []):
+                choice_id = _normalize_form_id(choice.get("FormID") or choice.get("form_id"))
+                if choice_id:
+                    index.setdefault(choice_id, choice)
+
+    for scene in quest.get("Scenes", []):
+        for dial_group in scene.get("Dials", []):
+            for dial in dial_group.get("Dialogues", []):
+                add_items([dial])
+    for dial_group in quest.get("StandaloneDials", []):
+        add_items(dial_group.get("Dialogues", []))
+    return index
+
+
+def build_pnam_context(chunk_items: list[dict], recent_context: list[dict], context_index: dict[str, dict], max_chain: int = 3) -> list[dict]:
+    context = []
+    seen = {id(item) for item in chunk_items}
+
+    for item in chunk_items:
+        current = item
+        for _ in range(max_chain):
+            prev_id = _normalize_form_id(current.get("InfoPNAM") or current.get("PNAM"))
+            if not prev_id:
+                break
+            prev_item = context_index.get(prev_id)
+            if not prev_item or id(prev_item) in seen:
+                break
+            context_item = dict(prev_item)
+            context_item["_context_source"] = "PNAM 체인"
+            context.append(context_item)
+            seen.add(id(prev_item))
+            current = prev_item
+
+    if context:
+        return context[-max_chain:] + recent_context[-3:]
+    return recent_context
+
+
+def filter_glossary_for_prompt(glossary_text: str, chunk_items: list[dict], context_lines: list[dict]) -> str:
+    if not glossary_text:
+        return ""
+    haystack = "\n".join(
+        str(item.get("Text", "") or "")
+        for item in list(chunk_items) + list(context_lines)
+    ).lower()
+    selected = []
+    for line in glossary_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        term = stripped[2:] if stripped.startswith("- ") else stripped
+        term = term.split(":", 1)[0].strip().lower()
+        if term and term in haystack:
+            selected.append(stripped)
+    return "\n".join(selected)
 
 # =============================================================================
 # 메인 실행부
@@ -425,7 +713,14 @@ def main():
             r_config["model_name"] = review_cfg["model"]
             review_backend = get_llm_backend(r_config, "step2_prompt")
             
-            orchestration_backend = TranslationOrchestrator(gen_backends, review_backend, glossary_text=glossary_text, work_dir=out_path.parent)
+            review_skip_similarity = float(orch_cfg.get("review_skip_similarity", 0.85))
+            orchestration_backend = TranslationOrchestrator(
+                gen_backends,
+                review_backend,
+                glossary_text=glossary_text,
+                work_dir=out_path.parent,
+                review_skip_similarity=review_skip_similarity,
+            )
             if orch_mode == "always":
                 backend = orchestration_backend
     except Exception as e:
@@ -462,7 +757,8 @@ def main():
         try:
             with open(profile_path, "r", encoding="utf-8") as f:
                 all_profiles = json.load(f)
-        except:
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning(f"프로필 캐시 로드 실패, 새로 생성합니다: {exc}")
             all_profiles = {}
 
     # Tone profiles come from the optional audio side pipeline and are safe to
@@ -480,118 +776,79 @@ def main():
         with open(tp_path, "r", encoding="utf-8") as f:
             tone_profiles = json.load(f)
 
-    for quest in quests:
-        if b_stop_requested: break
-        
-        q_id = quest.get("QuestID", "Unknown")
-        log.info(f"퀘스트 처리 중: {q_id}")
+    save_interval = max(1, int(config.get("step2_save_interval", 5)))
+    quest_workers = max(1, int(config.get("step2_quest_workers", 1 if args.profile_only else 4)))
+    quest_workers = min(quest_workers, max(1, len(quests)))
+    log.info(f"Quest 병렬 처리 workers={quest_workers}")
 
-        # 프로파일 로드 또는 생성
-        if q_id in all_profiles:
-            q_profile = all_profiles[q_id]
-        else:
-            q_profile = profile_scene(quest, profile_backend, args.use_ja_ref, mod_stem, rag)
-            all_profiles[q_id] = q_profile
+    all_risk_reports = []
+    all_chunk_logs = []
+    chunks_since_save = 0
+
+    def persist_progress(force: bool = False):
+        nonlocal chunks_since_save
+        if args.profile_only:
+            return
+        if force or chunks_since_save >= save_interval:
+            with open(progress_path, "w", encoding="utf-8") as f:
+                json.dump(scenes_data, f, ensure_ascii=False, indent=2)
+            chunks_since_save = 0
+
+    with ThreadPoolExecutor(max_workers=quest_workers) as executor:
+        future_map = {
+            executor.submit(
+                process_quest_translation,
+                copy.deepcopy(quest),
+                config=config,
+                mod_stem=mod_stem,
+                profile_backend=profile_backend,
+                backend=backend,
+                orchestration_backend=orchestration_backend,
+                glossary_text=glossary_text,
+                tone_profiles=tone_profiles,
+                cached_profile=all_profiles.get(quest.get("QuestID", "Unknown")),
+                use_ja_ref=args.use_ja_ref,
+                profile_only=args.profile_only,
+            ): quest_index
+            for quest_index, quest in enumerate(quests)
+        }
+
+        for future in as_completed(future_map):
+            quest_index = future_map[future]
+            result = future.result()
+            q_id = result.get("quest_id", "Unknown")
+            quests[quest_index] = result.get("quest", quests[quest_index])
+            all_profiles[q_id] = result.get("profile", {})
             with open(profile_path, "w", encoding="utf-8") as f:
                 json.dump(all_profiles, f, ensure_ascii=False, indent=2)
 
-        if args.profile_only: continue
+            all_risk_reports.extend(result.get("risk_report", []))
+            all_chunk_logs.extend(result.get("chunk_log", []))
+            chunks_since_save += result.get("chunk_count", 0)
+            persist_progress(force=bool(result.get("stopped")))
+            log.info(f"퀘스트 완료: {q_id}")
+            if b_stop_requested:
+                break
 
-        dial_flat_list = []
-        # Scene JSON is nested, but translation runs over a flat list so chunking
-        # and context windows behave consistently across scenes and choices.
-        # Scenes 내부 데이터 평탄화
-        for s in quest.get("Scenes", []):
-            for d in s.get("Dials", []):
-                for dial in d.get("Dialogues", []):
-                    txt = dial.get("Text")
-                    if txt:
-                        if dial.get("Translate"):
-                            pass
-                        elif is_only_tags_and_punct(txt):
-                            dial["Translate"] = txt
-                        else:
-                            add_item_contract(dial, plugin_name=mod_stem, record_type=dial.get("record_type", "INFO"), subrecord_path=dial.get("subrecord_path", "NAM1"))
-                            dial_flat_list.append(dial)
-                    for choice in dial.get("PlayerChoices", []):
-                        ctxt = choice.get("Text")
-                        if ctxt:
-                            if choice.get("Translate"):
-                                pass
-                            elif is_only_tags_and_punct(ctxt):
-                                choice["Translate"] = ctxt
-                            else:
-                                add_item_contract(choice, plugin_name=mod_stem, record_type=choice.get("record_type", "INFO"), subrecord_path=choice.get("subrecord_path", "CHOICE"))
-                                dial_flat_list.append(choice)
-        
-        # StandaloneDials 평탄화
-        for dial in quest.get("StandaloneDials", []):
-            for d in dial.get("Dialogues", []):
-                txt = d.get("Text")
-                if txt:
-                    if d.get("Translate"):
-                        pass
-                    elif is_only_tags_and_punct(txt):
-                        d["Translate"] = txt
-                    else:
-                        add_item_contract(d, plugin_name=mod_stem, record_type=d.get("record_type", "INFO"), subrecord_path=d.get("subrecord_path", "NAM1"))
-                        dial_flat_list.append(d)
-                for choice in d.get("PlayerChoices", []):
-                    ctxt = choice.get("Text")
-                    if ctxt:
-                        if choice.get("Translate"):
-                            pass
-                        elif is_only_tags_and_punct(ctxt):
-                            choice["Translate"] = ctxt
-                        else:
-                            add_item_contract(choice, plugin_name=mod_stem, record_type=choice.get("record_type", "INFO"), subrecord_path=choice.get("subrecord_path", "CHOICE"))
-                            dial_flat_list.append(choice)
+    persist_progress(force=True)
 
-        chunk_size = int(config.get("step2_chunk_size", config.get("chunk_size", 40)))
-        max_chunk_chars = int(config.get("step2_max_chunk_chars", 3500))
-        max_input_tokens = int(config.get("step2_max_input_tokens", 6000))
-        max_output_tokens = int(config.get("step2_max_output_tokens", 4000))
-        chunks = build_adaptive_chunks(dial_flat_list, chunk_size, max_chunk_chars, max_input_tokens + max_output_tokens)
-        recent_context = []
-        risk_report = []
-        chunk_log = []
-
-        num_chunks = len(chunks)
-        for i, chunk in enumerate(chunks):
-            if b_stop_requested: break
-            chunk_id = f"{q_id}_chunk_{i + 1:03d}"
-            for item in chunk:
-                item["chunk_id"] = chunk_id
-            chunk_log.append(build_chunk_log_entry(chunk_id, chunk, str(config.get("model_name") or config.get("models", {}).get("translation", "fast_translation"))))
-            log.info(f"  -> [청크 {i+1}/{num_chunks}] {len(chunk)}개 대사 번역 중...")
-            
-            # 번역 대상이 이미 채워져 있는지 확인 (중복 번역 방지 로직은 필요시 추가)
-            translate_scene_recursive(chunk, backend, mod_stem, recent_context, q_profile, glossary_text, rag, tone_profiles, orchestration_backend=orchestration_backend, risk_report=risk_report)
-            # Keep a short trailing window so adjacent chunks stay coherent
-            # without letting prompts grow indefinitely.
-            recent_context = chunk[-5:]
-
-            # 중간 저장 (실시간 반영은 임시 파일에)
-            with open(progress_path, "w", encoding="utf-8") as f:
-                json.dump(scenes_data, f, ensure_ascii=False, indent=2)
-
-        if risk_report:
-            risk_path = out_path.with_suffix(".risk_report.json")
-            with open(risk_path, "w", encoding="utf-8") as f:
-                json.dump(risk_report, f, ensure_ascii=False, indent=2)
-        if chunk_log:
-            chunk_log_path = out_path.with_suffix(".chunk_log.json")
-            with open(chunk_log_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "prompt_version": PROMPT_VERSION,
-                        "tool_version": TOOL_VERSION,
-                        "chunks": chunk_log,
-                    },
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
+    if all_risk_reports:
+        risk_path = out_path.with_suffix(".risk_report.json")
+        with open(risk_path, "w", encoding="utf-8") as f:
+            json.dump(all_risk_reports, f, ensure_ascii=False, indent=2)
+    if all_chunk_logs:
+        chunk_log_path = out_path.with_suffix(".chunk_log.json")
+        with open(chunk_log_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "prompt_version": PROMPT_VERSION,
+                    "tool_version": TOOL_VERSION,
+                    "chunks": sorted(all_chunk_logs, key=lambda item: item.get("chunk_id", "")),
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
 
     if b_stop_requested:
         log.info(f"⚠️ 중지됨. 진행 상황 보존: {progress_path}")

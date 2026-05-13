@@ -14,7 +14,8 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QLabel, QLineEdit, QPushButton, QComboBox, QTextEdit,
     QFileDialog, QMessageBox, QGroupBox, QFormLayout, QCheckBox,
-    QTableWidget, QTableWidgetItem, QHeaderView, QSplitter
+    QTableWidget, QTableWidgetItem, QHeaderView, QSplitter,
+    QSpinBox, QDoubleSpinBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -22,6 +23,21 @@ from PyQt6.QtWidgets import (
 )
 
 CONFIG_FILE = "config.json"
+
+DB_TABLE_COLUMNS = {
+    "glossary": {
+        "value_columns": ("english", "korean"),
+        "headers": ["ID (읽기전용)", "영어 (English)", "한국어 (Korean)"],
+    },
+    "translation_memory": {
+        "value_columns": ("english", "korean"),
+        "headers": ["ID (읽기전용)", "영어 (English)", "한국어 (Korean)"],
+    },
+    "npc_names": {
+        "value_columns": ("form_id", "name"),
+        "headers": ["ID (읽기전용)", "FormID (8자리 Hex)", "이름 (Name)"],
+    },
+}
 
 import base64
 
@@ -38,7 +54,7 @@ def _deobfuscate(text: str) -> str:
         key = "STARFIELD"
         deobfuscated = "".join(chr(ord(c) ^ ord(key[i % len(key)])) for i, c in enumerate(decoded))
         return deobfuscated
-    except:
+    except Exception:
         return text
 
 class ConfigManager:
@@ -66,9 +82,19 @@ class ConfigManager:
             "pipeline_mode": "high_quality",
             "step2_chunk_size": 40,
             "step2_max_chunk_chars": 3500,
+            "step2_save_interval": 5,
+            "step2_quest_workers": 4,
+            "step4_rpm_delay": 0.0,
+            "step4_workers": 4,
+            "audio_profile": {
+                "max_samples": 5,
+                "use_audio_modality": False,
+                "demographic_audio_fallback": True
+            },
             "orchestrator": {
                 "enabled": False,
                 "mode": "risky_only",
+                "review_skip_similarity": 0.85,
                 "generation_models": [
                     {"provider": "1minai", "model": "gpt-4o-mini", "persona": "Natural: 가장 자연스럽고 구어체적인 한국어 대사체에 집중하세요."},
                     {"provider": "1minai", "model": "claude-3-5-sonnet", "persona": "Faithful: 원문의 의미와 문장 구조를 최대한 유지하며 오역 없는 번역에 집중하세요."}
@@ -168,7 +194,7 @@ class WorkerThread(QThread):
             if self._is_stopped:
                 try:
                     subprocess.run(['taskkill', '/F', '/T', '/PID', str(self.process.pid)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                except:
+                except Exception:
                     self.process.kill()
                 self.process.wait()
                 self.log_signal.emit(f"[{self.step}] 작업이 중지되었습니다.")
@@ -421,6 +447,20 @@ class MainApp(QMainWindow):
         orch_data = self.config_mgr.config.get("orchestrator", {})
         self.orch_enabled_check.setChecked(orch_data.get("enabled", False))
         orch_layout.addWidget(self.orch_enabled_check)
+
+        orch_controls = QFormLayout()
+        self.orch_mode_combo = QComboBox()
+        self.orch_mode_combo.addItems(["risky_only", "always", "off"])
+        self.orch_mode_combo.setCurrentText(orch_data.get("mode", "risky_only"))
+        orch_controls.addRow("실행 모드:", self.orch_mode_combo)
+
+        self.orch_review_skip_spin = QDoubleSpinBox()
+        self.orch_review_skip_spin.setRange(0.0, 1.0)
+        self.orch_review_skip_spin.setSingleStep(0.05)
+        self.orch_review_skip_spin.setDecimals(2)
+        self.orch_review_skip_spin.setValue(float(orch_data.get("review_skip_similarity", 0.85)))
+        orch_controls.addRow("후보 유사도 감수 생략 기준:", self.orch_review_skip_spin)
+        orch_layout.addLayout(orch_controls)
         
         self.orch_config_edit = QTextEdit()
         self.orch_config_edit.setPlaceholderText("오케스트레이터 세부 설정 (JSON)")
@@ -434,6 +474,34 @@ class MainApp(QMainWindow):
         
         orch_group.setLayout(orch_layout)
         layout.addWidget(orch_group)
+
+        perf_group = QGroupBox("성능 / 병렬 처리 설정")
+        perf_layout = QFormLayout()
+
+        self.step2_workers_spin = QSpinBox()
+        self.step2_workers_spin.setRange(1, 16)
+        self.step2_workers_spin.setValue(int(self.config_mgr.config.get("step2_quest_workers", 4)))
+        perf_layout.addRow("Step2 Quest 병렬 workers:", self.step2_workers_spin)
+
+        self.step2_save_interval_spin = QSpinBox()
+        self.step2_save_interval_spin.setRange(1, 100)
+        self.step2_save_interval_spin.setValue(int(self.config_mgr.config.get("step2_save_interval", 5)))
+        perf_layout.addRow("Step2 진행 저장 청크 간격:", self.step2_save_interval_spin)
+
+        self.step4_workers_spin = QSpinBox()
+        self.step4_workers_spin.setRange(1, 16)
+        self.step4_workers_spin.setValue(int(self.config_mgr.config.get("step4_workers", 4)))
+        perf_layout.addRow("Step4 LLM 병렬 workers:", self.step4_workers_spin)
+
+        self.step4_delay_spin = QDoubleSpinBox()
+        self.step4_delay_spin.setRange(0.0, 30.0)
+        self.step4_delay_spin.setSingleStep(0.1)
+        self.step4_delay_spin.setDecimals(1)
+        self.step4_delay_spin.setValue(float(self.config_mgr.config.get("step4_rpm_delay", 0.0)))
+        perf_layout.addRow("Step4 요청 후 대기(초):", self.step4_delay_spin)
+
+        perf_group.setLayout(perf_layout)
+        layout.addWidget(perf_group)
 
         save_btn = QPushButton("설정 저장")
         save_btn.clicked.connect(self.save_settings)
@@ -511,6 +579,8 @@ class MainApp(QMainWindow):
             orch_json = json.loads(self.orch_config_edit.toPlainText())
             self.config_mgr.config["orchestrator"] = {
                 "enabled": self.orch_enabled_check.isChecked(),
+                "mode": self.orch_mode_combo.currentText(),
+                "review_skip_similarity": self.orch_review_skip_spin.value(),
                 "generation_models": orch_json.get("generation_models", []),
                 "review_model": orch_json.get("review_model", {})
             }
@@ -522,6 +592,17 @@ class MainApp(QMainWindow):
         if hasattr(self, 'step5_prompt_edit'):
             self.config_mgr.config["step5_prompt"] = self.step5_prompt_edit.toPlainText()
         self.config_mgr.config["use_ja_ref"] = self.use_ja_ref_check.isChecked()
+        if hasattr(self, "step2_workers_spin"):
+            self.config_mgr.config["step2_quest_workers"] = self.step2_workers_spin.value()
+            self.config_mgr.config["step2_save_interval"] = self.step2_save_interval_spin.value()
+            self.config_mgr.config["step4_workers"] = self.step4_workers_spin.value()
+            self.config_mgr.config["step4_rpm_delay"] = self.step4_delay_spin.value()
+        if hasattr(self, "audio_profile_samples_spin"):
+            audio_cfg = dict(self.config_mgr.config.get("audio_profile", {}))
+            audio_cfg["max_samples"] = self.audio_profile_samples_spin.value()
+            audio_cfg["use_audio_modality"] = self.audio_profile_modality_check.isChecked()
+            audio_cfg["demographic_audio_fallback"] = self.audio_profile_demographic_check.isChecked()
+            self.config_mgr.config["audio_profile"] = audio_cfg
             
         self.config_mgr.save()
         self.append_log("모든 설정 및 프롬프트가 저장되었습니다.")
@@ -582,18 +663,14 @@ class MainApp(QMainWindow):
 
     def load_db_data(self):
         table = self.db_table_combo.currentText()
-        if table not in ("glossary", "translation_memory", "npc_names"):
+        table_info = DB_TABLE_COLUMNS.get(table)
+        if not table_info:
             return
             
         search_query = self.db_search_input.text().strip()
         
-        col_map = {
-            "glossary": ("english", "korean", ["ID (읽기전용)", "영어 (English)", "한국어 (Korean)"]),
-            "translation_memory": ("english", "korean", ["ID (읽기전용)", "영어 (English)", "한국어 (Korean)"]),
-            "npc_names": ("form_id", "name", ["ID (읽기전용)", "FormID (8자리 Hex)", "이름 (Name)"])
-        }
-        c1, c2, headers = col_map[table]
-        self.db_table.setHorizontalHeaderLabels(headers)
+        c1, c2 = table_info["value_columns"]
+        self.db_table.setHorizontalHeaderLabels(table_info["headers"])
         
         try:
             conn = self.get_db_connection()
@@ -638,6 +715,10 @@ class MainApp(QMainWindow):
             return
             
         table = self.db_table_combo.currentText()
+        if table not in DB_TABLE_COLUMNS:
+            QMessageBox.warning(self, "DB Error", f"허용되지 않은 테이블입니다: {table}")
+            return
+
         conn = self.get_db_connection()
         c = conn.cursor()
         
@@ -658,6 +739,9 @@ class MainApp(QMainWindow):
     def save_db_changes(self):
         try:
             table = self.db_table_combo.currentText()
+            if table not in DB_TABLE_COLUMNS:
+                raise ValueError(f"허용되지 않은 테이블입니다: {table}")
+
             conn = self.get_db_connection()
             c = conn.cursor()
             
@@ -676,11 +760,15 @@ class MainApp(QMainWindow):
                 if id_item.text() == "NEW":
                     if table == "translation_memory":
                         c.execute(f"INSERT OR IGNORE INTO {table} (english, korean, english_length) VALUES (?, ?, ?)", (en_text, ko_text, len(en_text)))
+                    elif table == "npc_names":
+                        c.execute(f"INSERT OR IGNORE INTO {table} (form_id, name) VALUES (?, ?)", (en_text.upper(), ko_text))
                     else:
                         c.execute(f"INSERT OR IGNORE INTO {table} (english, korean) VALUES (?, ?)", (en_text, ko_text))
                 else:
                     if table == "translation_memory":
                         c.execute(f"UPDATE {table} SET english=?, korean=?, english_length=? WHERE id=?", (en_text, ko_text, len(en_text), id_item.text()))
+                    elif table == "npc_names":
+                        c.execute(f"UPDATE {table} SET form_id=?, name=? WHERE id=?", (en_text.upper(), ko_text, id_item.text()))
                     else:
                         c.execute(f"UPDATE {table} SET english=?, korean=? WHERE id=?", (en_text, ko_text, id_item.text()))
                     
@@ -1600,10 +1688,24 @@ class MainApp(QMainWindow):
         self.audio_profile_out.setPlaceholderText("tone_profiles.json (Step 2에서 참조됨)")
         p_layout.addRow("최종 프로파일 저장 경로 (-o):", self.audio_profile_out)
 
+        audio_cfg = self.config_mgr.config.get("audio_profile", {})
+        self.audio_profile_samples_spin = QSpinBox()
+        self.audio_profile_samples_spin.setRange(1, 20)
+        self.audio_profile_samples_spin.setValue(int(audio_cfg.get("max_samples", self.config_mgr.config.get("audio_profile_max_samples", 5))))
+        p_layout.addRow("화자별 정량 분석 샘플 수:", self.audio_profile_samples_spin)
+
+        self.audio_profile_modality_check = QCheckBox("Gemini 오디오 모달리티도 함께 사용")
+        self.audio_profile_modality_check.setChecked(bool(audio_cfg.get("use_audio_modality", self.config_mgr.config.get("audio_profile_use_audio_modality", False))))
+        p_layout.addRow("오디오 직접 전송:", self.audio_profile_modality_check)
+
+        self.audio_profile_demographic_check = QCheckBox("성별/연령 불확실 시 오디오 1샘플 보강")
+        self.audio_profile_demographic_check.setChecked(bool(audio_cfg.get("demographic_audio_fallback", True)))
+        p_layout.addRow("성별/연령 보강:", self.audio_profile_demographic_check)
+
         profile_group.setLayout(p_layout)
         layout.addWidget(profile_group)
 
-        btn_p_run = QPushButton("오디오 분석 및 어투 가이드 생성 실행 (Gemini 필요)")
+        btn_p_run = QPushButton("정량 음향 분석 및 어투 가이드 생성 실행")
         btn_p_run.setStyleSheet("background-color: #1565c0; color: white; font-weight: bold;")
         btn_p_run.clicked.connect(self.run_audio_profile)
         layout.addWidget(btn_p_run)
@@ -1643,6 +1745,13 @@ class MainApp(QMainWindow):
         if not self.audio_profile_out.text():
             p_dir = os.path.dirname(self.audio_priority_input.text())
             self.audio_profile_out.setText(os.path.join(p_dir, "tone_profiles.json"))
+
+        audio_cfg = dict(self.config_mgr.config.get("audio_profile", {}))
+        audio_cfg["max_samples"] = self.audio_profile_samples_spin.value()
+        audio_cfg["use_audio_modality"] = self.audio_profile_modality_check.isChecked()
+        audio_cfg["demographic_audio_fallback"] = self.audio_profile_demographic_check.isChecked()
+        self.config_mgr.config["audio_profile"] = audio_cfg
+        self.config_mgr.save()
 
         self.run_background_task("AudioProfile", {
             "config": CONFIG_FILE,
@@ -1688,6 +1797,20 @@ class CommonConfigDialog(QDialog):
         form.addRow("오디오 샘플 분석 AI:", self.cb_audio)
         form.addRow("번역 AI:", self.cb_trans)
         form.addRow("감수 AI:", self.cb_review)
+
+        audio_cfg = self.config.get("audio_profile", {})
+        self.audio_samples_spin = QSpinBox()
+        self.audio_samples_spin.setRange(1, 20)
+        self.audio_samples_spin.setValue(int(audio_cfg.get("max_samples", self.config.get("audio_profile_max_samples", 5))))
+        form.addRow("오디오 정량 샘플 수:", self.audio_samples_spin)
+
+        self.audio_modality_check = QCheckBox("오디오 파일 직접 전송도 사용")
+        self.audio_modality_check.setChecked(bool(audio_cfg.get("use_audio_modality", self.config.get("audio_profile_use_audio_modality", False))))
+        form.addRow("오디오 모달리티:", self.audio_modality_check)
+
+        self.audio_demographic_check = QCheckBox("성별/연령 불확실 시 오디오 1샘플 보강")
+        self.audio_demographic_check.setChecked(bool(audio_cfg.get("demographic_audio_fallback", True)))
+        form.addRow("성별/연령 보강:", self.audio_demographic_check)
         
         layout.addLayout(form)
         
@@ -1747,6 +1870,11 @@ class CommonConfigDialog(QDialog):
                 "audio_profile": self.cb_audio.currentText(),
                 "translation": self.cb_trans.currentText(),
                 "review": self.cb_review.currentText()
+            },
+            "audio_profile": {
+                "max_samples": self.audio_samples_spin.value(),
+                "use_audio_modality": self.audio_modality_check.isChecked(),
+                "demographic_audio_fallback": self.audio_demographic_check.isChecked()
             },
             "pipeline": {
                 "auto_apply_cli": True

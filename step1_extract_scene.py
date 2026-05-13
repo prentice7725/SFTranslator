@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import os
 import sys
 import struct
@@ -25,6 +26,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 HEADER_TES4 = b"TES4"
 HEADER_GRUP = b"GRUP"
+log = logging.getLogger("Step1_Extractor")
 
 
 @dataclass
@@ -391,7 +393,8 @@ def decode_string(data: bytes) -> str:
     except UnicodeDecodeError:
         try:
             return data.decode("cp1252")
-        except:
+        except UnicodeDecodeError as exc:
+            log.debug(f"문자열 디코드 실패, 빈 문자열로 처리: {exc}")
             return ""
 
 
@@ -444,10 +447,12 @@ class StarfieldSceneExtractor:
         self.dials = {}  # form_id -> DIAL data dict
         self.scenes_actors = {}  # form_id -> {alias_id: npc_form_id}
         self.scene_dial_to_alias = {}  # form_id(DIAL) -> alias_id
+        self.scene_dial_to_scene = {}  # form_id(DIAL) -> form_id(SCEN)
         self.scenes = {}  # 🔥 추가: 씬 타임라인 순서를 저장할 딕셔너리
         self.masters = [] # 🔥 추가: 마스터 파일 목록 (MAST)
         self.vtyps = {}   # 🔥 추가: Voice Type 목록
         self.current_dial = None
+        self.parse_fail_count = 0
 
         # 바닐라 NPC 데이터 로드 (추가된 부분)
         self.vanilla_npcs = {}
@@ -468,6 +473,10 @@ class StarfieldSceneExtractor:
             except json.JSONDecodeError as e:
                 print(f"Failed to decode vanilla_npcs.json: {e}")
 
+    def _skip_parse_error(self, context: str, exc: Exception):
+        self.parse_fail_count += 1
+        log.debug(f"[SKIP] {context}: {exc}")
+
     def parse(self):
         import mmap
 
@@ -476,6 +485,8 @@ class StarfieldSceneExtractor:
             mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
             self._read_chunk(mm)
             mm.close()
+        if self.parse_fail_count:
+            print(f"[Step1] 파싱 스킵 {self.parse_fail_count}건 발생 (자세한 내용은 debug 로그 참고).")
         
         # Ensure Starfield.esm is at index 0 if it's not the file itself
         base_name = os.path.basename(self.file_path).lower()
@@ -686,8 +697,8 @@ class StarfieldSceneExtractor:
                             conditions.append(p1)
                         elif func == 566 and p1 != 0xFFFFFFFF:  # GetIsAlias
                             alias_conds.append(p1)
-                    except:
-                        pass
+                    except (struct.error, ValueError) as exc:
+                        self._skip_parse_error(f"DIAL CTDA 파싱 실패 (formid={form_id:08X})", exc)
                 elif fd.f_type == b"QNAM" and len(fd.f_data) >= 4:
                     qnam = struct.unpack("<I", fd.f_data[:4])[0]
 
@@ -727,12 +738,14 @@ class StarfieldSceneExtractor:
                         dial_fid = struct.unpack("<I", fd.f_data[:4])[0]
                         if not ordered_dials or ordered_dials[-1] != dial_fid:
                             ordered_dials.append(dial_fid)
+                        if dial_fid:
+                            self.scene_dial_to_scene[dial_fid] = form_id
 
                         # 삭제된 기존 코드 복원: SCEN 대화와 화자를 연결해주는 핵심 포인터
                         if curr_action_alias is not None and dial_fid != 0:
                             self.scene_dial_to_alias[dial_fid] = curr_action_alias
-                    except:
-                        pass
+                    except (struct.error, ValueError) as exc:
+                        self._skip_parse_error(f"SCEN DATA 파싱 실패 (formid={form_id:08X})", exc)
 
             self.scenes_actors[form_id] = scene_actors
             self.scenes[form_id] = {"dials": ordered_dials, "edid": edid}  # 🔥 SCEN 딕셔너리에 대화 순서와 EDID 저장
@@ -759,26 +772,26 @@ class StarfieldSceneExtractor:
                 if fd.f_type == b"PNAM" and len(fd.f_data) >= 4:
                     try:
                         info_data["PNAM"] = struct.unpack("<I", fd.f_data[:4])[0]
-                    except:
-                        pass
+                    except (struct.error, ValueError) as exc:
+                        self._skip_parse_error(f"INFO PNAM 파싱 실패 (formid={form_id:08X})", exc)
                 elif fd.f_type == b"RNAM":
                     info_data["IsPrompt"] = True
                 elif fd.f_type == b"TRDA" and len(fd.f_data) >= 8:
                     try:
                         current_trda_id = struct.unpack("<I", fd.f_data[4:8])[0]
-                    except:
-                        pass
+                    except (struct.error, ValueError) as exc:
+                        self._skip_parse_error(f"INFO TRDA 파싱 실패 (formid={form_id:08X})", exc)
                 elif fd.f_type == b"VNAM" and len(fd.f_data) >= 4:
                     # VNAM이 명시적으로 존재한다면 이를 우선시 (폴백용)
                     try:
                         info_data["AudioID"] = struct.unpack("<I", fd.f_data[:4])[0]
-                    except:
-                        pass
+                    except (struct.error, ValueError) as exc:
+                        self._skip_parse_error(f"INFO VNAM 파싱 실패 (formid={form_id:08X})", exc)
                 elif fd.f_type == b"ANAM" and len(fd.f_data) >= 4:
                     try:
                         info_data["Speaker"] = struct.unpack("<I", fd.f_data[:4])[0]
-                    except:
-                        pass
+                    except (struct.error, ValueError) as exc:
+                        self._skip_parse_error(f"INFO ANAM 파싱 실패 (formid={form_id:08X})", exc)
 
                 # 🔥 수정: Starfield는 TCLT뿐만 아니라 TPIC를 사용하여 연결된 선택지를 기록합니다.
                 elif fd.f_type in (b"TCLT", b"TPIC"):
@@ -787,8 +800,8 @@ class StarfieldSceneExtractor:
                             try:
                                 linked_id = struct.unpack("<I", fd.f_data[i : i + 4])[0]
                                 info_data["LinkedTopics"].append(linked_id)
-                            except:
-                                pass
+                            except (struct.error, ValueError) as exc:
+                                self._skip_parse_error(f"INFO 링크 토픽 파싱 실패 (formid={form_id:08X})", exc)
 
                 # INFO와 DIAL의 CTDA 조건문 파싱 위치에 공통으로 적용
                 elif fd.f_type == b"CTDA" and len(fd.f_data) >= 24:
@@ -805,8 +818,8 @@ class StarfieldSceneExtractor:
                             info_data["VoiceTypes"].append(p1)
                         elif func == 74 and p1 != 0xFFFFFFFF:  # GetInFaction
                             info_data["Factions"].append(p1)
-                    except:
-                        pass
+                    except (struct.error, ValueError) as exc:
+                        self._skip_parse_error(f"INFO CTDA 파싱 실패 (formid={form_id:08X})", exc)
 
                 # 강제로 스트링 판별 시도 (대사 본문 및 플레이어 프롬프트 텍스트)
                 if fd.f_type in (b"NAM1", b"RNAM"):
@@ -837,15 +850,186 @@ class StarfieldSceneExtractor:
                             info_data["Texts"].append({
                                 "StringID": s_id, 
                                 "Text": text, 
-                                "AudioID": line_audio_id
+                                "AudioID": line_audio_id,
+                                "FieldType": fd.f_type.decode("ascii", errors="ignore"),
                             })
                             current_trda_id = None # 사용 후 초기화
-                    except:
-                        pass
+                    except (struct.error, ValueError, UnicodeDecodeError) as exc:
+                        self._skip_parse_error(f"INFO 대사 텍스트 파싱 실패 (formid={form_id:08X})", exc)
 
             # 텍스트가 있거나, 다음 대화로 넘어가는 연결점(TCLT)이 있는 경우 수집 (라우팅 노드)
             if info_data["Texts"] or info_data["LinkedTopics"]:
                 self.infos[form_id] = info_data
+
+    def _speaker_candidate(self, fid: int | None, fallback_name: str = "") -> tuple[str, int | None]:
+        if fid in (7, 0x14):
+            return "Player", 7
+        if fid:
+            return self.get_npc_name(fid), fid
+        return fallback_name or "Unknown", None
+
+    def _add_speaker_score(self, scores: dict, fid: int | None, name: str, points: int, reason: str):
+        if not name or name == "Unknown":
+            return
+        key = (fid, name)
+        if key not in scores:
+            scores[key] = {"score": 0, "reasons": []}
+        scores[key]["score"] += points
+        scores[key]["reasons"].append(reason)
+
+    def _alias_speaker_candidate(self, alias_id: int, quest_id: int | None) -> tuple[str, int | None]:
+        if quest_id and quest_id in self.quests:
+            quest = self.quests[quest_id]
+            npc_fid = quest.get("alias_npcs", {}).get(alias_id)
+            if npc_fid:
+                return self.get_npc_name(npc_fid), npc_fid
+            alias_name = quest.get("aliases", {}).get(alias_id)
+            if alias_name:
+                return alias_name, None
+
+        if alias_id == 0:
+            return "", None
+
+        for scene_actors in self.scenes_actors.values():
+            if alias_id in scene_actors:
+                npc_fid = scene_actors[alias_id]
+                return self.get_npc_name(npc_fid), npc_fid
+
+        return f"Alias_{alias_id}", None
+
+    def _single_scene_actor_candidate(self, scene_id: int | None) -> tuple[str, int | None, dict]:
+        if not scene_id or scene_id not in self.scenes_actors:
+            return "", None, {"scene_actor_count": 0}
+        actor_fids = [
+            fid for fid in self.scenes_actors.get(scene_id, {}).values()
+            if fid not in (0, 0xFFFFFFFF)
+        ]
+        unique_actor_fids = sorted(set(actor_fids))
+        if len(unique_actor_fids) == 1:
+            name, fid = self._speaker_candidate(unique_actor_fids[0])
+            return name, fid, {"scene_actor_count": 1}
+        return "", None, {"scene_actor_count": len(unique_actor_fids)}
+
+    def _single_quest_alias_candidate(self, quest_id: int | None) -> tuple[str, int | None, dict]:
+        if not quest_id or quest_id not in self.quests:
+            return "", None, {"quest_alias_npc_count": 0, "quest_alias_name_count": 0}
+
+        quest = self.quests[quest_id]
+        alias_npc_fids = [
+            fid for fid in quest.get("alias_npcs", {}).values()
+            if fid not in (0, 7, 0x14, 0xFFFFFFFF)
+        ]
+        unique_alias_npc_fids = sorted(set(alias_npc_fids))
+        if len(unique_alias_npc_fids) == 1:
+            name, fid = self._speaker_candidate(unique_alias_npc_fids[0])
+            return name, fid, {
+                "quest_alias_npc_count": 1,
+                "quest_alias_name_count": len(set(quest.get("aliases", {}).values())),
+            }
+
+        alias_names = []
+        for alias_name in quest.get("aliases", {}).values():
+            clean = str(alias_name or "").strip()
+            if not clean:
+                continue
+            lowered = clean.lower()
+            if lowered in {"player", "alias_player"}:
+                continue
+            if lowered.startswith(("alias_player", "playeralias")):
+                continue
+            alias_names.append(clean)
+        unique_alias_names = sorted(set(alias_names))
+        if len(unique_alias_names) == 1:
+            return unique_alias_names[0], None, {
+                "quest_alias_npc_count": len(unique_alias_npc_fids),
+                "quest_alias_name_count": 1,
+            }
+
+        return "", None, {
+            "quest_alias_npc_count": len(unique_alias_npc_fids),
+            "quest_alias_name_count": len(unique_alias_names),
+        }
+
+    def _resolve_info_speaker(self, info: dict, dial_dict: dict) -> tuple[str, int | None, dict]:
+        scores = {}
+        player_score = 0
+        player_reasons = []
+
+        spk_id = info.get("Speaker")
+        if spk_id in (7, 0x14):
+            player_score += 20
+            player_reasons.append("ANAM player fid +20")
+        elif spk_id:
+            name, fid = self._speaker_candidate(spk_id)
+            self._add_speaker_score(scores, fid, name, 8, "INFO ANAM +8")
+
+        if info.get("IsPrompt"):
+            player_score += 15
+            player_reasons.append("RNAM prompt +15")
+
+        parent_dial = info.get("ParentDial")
+        quest_id = dial_dict.get("quest")
+
+        if parent_dial in self.scene_dial_to_alias:
+            alias_id = self.scene_dial_to_alias[parent_dial]
+            name, fid = self._alias_speaker_candidate(alias_id, quest_id)
+            self._add_speaker_score(scores, fid, name, 6, f"SCEN ALID alias {alias_id} +6")
+
+        scene_id = self.scene_dial_to_scene.get(parent_dial)
+        name, fid, scene_actor_meta = self._single_scene_actor_candidate(scene_id)
+        if name:
+            self._add_speaker_score(scores, fid, name, 4, f"single SCEN actor {scene_id:08X} +4")
+
+        name, fid, quest_alias_meta = self._single_quest_alias_candidate(quest_id)
+        if name:
+            self._add_speaker_score(scores, fid, name, 2, f"single QUST alias {quest_id:08X} +2")
+
+        for cond_id in info.get("Conditions", []):
+            name, fid = self._speaker_candidate(cond_id)
+            self._add_speaker_score(scores, fid, name, 5, "INFO GetIsID +5")
+
+        for cond_id in dial_dict.get("conditions", []):
+            name, fid = self._speaker_candidate(cond_id)
+            self._add_speaker_score(scores, fid, name, 5, "DIAL GetIsID +5")
+
+        for alias_id in info.get("AliasConditions", []):
+            name, fid = self._alias_speaker_candidate(alias_id, quest_id)
+            self._add_speaker_score(scores, fid, name, 5, f"INFO GetIsAlias {alias_id} +5")
+
+        for alias_id in dial_dict.get("aliases", []):
+            name, fid = self._alias_speaker_candidate(alias_id, quest_id)
+            self._add_speaker_score(scores, fid, name, 4, f"DIAL GetIsAlias {alias_id} +4")
+
+        for vtyp_id in info.get("VoiceTypes", []):
+            vtyp_name = self.vtyps.get(vtyp_id, f"{vtyp_id:08X}")
+            self._add_speaker_score(scores, None, f"VoiceType_{vtyp_name}", 1, "INFO GetIsVoiceType +1")
+
+        for fact_id in info.get("Factions", []):
+            self._add_speaker_score(scores, fact_id, f"Faction_{fact_id:08X}", 1, "INFO GetInFaction +1")
+
+        best_key = None
+        best_score = 0
+        if scores:
+            best_key, best_data = max(scores.items(), key=lambda item: item[1]["score"])
+            best_score = best_data["score"]
+
+        if player_score >= 15:
+            return "Player", 7, {"player_score": player_score, "npc_score": best_score, "reasons": player_reasons}
+
+        if player_score > best_score and best_score > 0:
+            return "Player", 7, {"player_score": player_score, "npc_score": best_score, "reasons": player_reasons}
+
+        if best_key:
+            fid, name = best_key
+            return name, fid, {"player_score": player_score, "npc_score": best_score, "reasons": scores[best_key]["reasons"]}
+
+        return "Unknown", None, {
+            "player_score": player_score,
+            "npc_score": 0,
+            "reasons": [],
+            **scene_actor_meta,
+            **quest_alias_meta,
+        }
 
     def build_quest_batches(self) -> dict:
         """
@@ -853,151 +1037,14 @@ class StarfieldSceneExtractor:
         가장 실용적인 번역 컨텍스트를 제공합니다.
         """
 
-        # 1. INFO별 화자 1차 식별
+        # 1. INFO별 화자 1차 식별: 여러 신호를 점수화해 충돌을 보존합니다.
         for current_id, info in self.infos.items():
-            spk_id = info["Speaker"]
-            is_prompt = info.get("IsPrompt", False)
-            info_conds = info.get("Conditions", [])
-            info_aliases = info.get("AliasConditions", [])
-
             parent_dial = info.get("ParentDial")
             dial_dict = self.dials.get(parent_dial, {}) if parent_dial else {}
-            dial_conds = dial_dict.get("conditions", [])
-            dial_aliases = dial_dict.get("aliases", [])
-
-            speaker_name = "Unknown"
-            speaker_fid = None
-
-            if spk_id and spk_id != 0:
-                speaker_fid = spk_id
-                speaker_name = self.get_npc_name(spk_id)
-            elif is_prompt:
-                speaker_fid = 7 # Player
-                speaker_name = "Player"
-            else:
-                found_cond_spk = False
-
-                # 1. INFO GetIsID
-                for cond_id in info_conds:
-                    speaker_fid = cond_id
-                    speaker_name = self.get_npc_name(cond_id)
-                    found_cond_spk = True
-                    break
-
-                # 2. DIAL GetIsID
-                if not found_cond_spk:
-                    for cond_id in dial_conds:
-                        speaker_fid = cond_id
-                        speaker_name = self.get_npc_name(cond_id)
-                        found_cond_spk = True
-                        break
-
-                # 3. SCEN->DIAL (Action) GetIsAlias
-                if not found_cond_spk and parent_dial in self.scene_dial_to_alias:
-                    scen_alias_id = self.scene_dial_to_alias[parent_dial]
-                    # Find which SCEN provides this NPC
-                    for s_actors in self.scenes_actors.values():
-                        if scen_alias_id in s_actors:
-                            npc_fid = s_actors[scen_alias_id]
-                            speaker_name = self.get_npc_name(npc_fid)
-                            speaker_fid = npc_fid
-                            found_cond_spk = True
-                            break
-                    if not found_cond_spk:
-                        quest_id = dial_dict.get("quest")
-                        if quest_id and quest_id in self.quests:
-                            q = self.quests[quest_id]
-                            npc_fid = q.get("alias_npcs", {}).get(scen_alias_id)
-                            if npc_fid:
-                                speaker_name = self.get_npc_name(npc_fid)
-                                speaker_fid = npc_fid
-                                found_cond_spk = True
-                            if not found_cond_spk:
-                                aname = q.get("aliases", {}).get(scen_alias_id)
-                                if aname:
-                                    speaker_name = aname
-                                    found_cond_spk = True
-                    if not found_cond_spk:
-                        speaker_name = f"Alias_{scen_alias_id}"
-                        found_cond_spk = True
-
-                # 4. INFO GetIsAlias
-                if not found_cond_spk and info_aliases:
-                    for alias_id in info_aliases:
-                        if found_cond_spk:
-                            break
-                        quest_id = dial_dict.get("quest")
-                        if quest_id and quest_id in self.quests:
-                            q = self.quests[quest_id]
-                            npc_fid = q.get("alias_npcs", {}).get(alias_id)
-                            if npc_fid:
-                                speaker_name = self.get_npc_name(npc_fid)
-                                speaker_fid = npc_fid
-                                found_cond_spk = True
-                            if not found_cond_spk:
-                                aname = q.get("aliases", {}).get(alias_id)
-                                if aname:
-                                    speaker_name = aname
-                                    found_cond_spk = True
-                        if not found_cond_spk:
-                            for s_actors in self.scenes_actors.values():
-                                if alias_id in s_actors:
-                                    npc_fid = s_actors[alias_id]
-                                    speaker_name = self.get_npc_name(npc_fid)
-                                    speaker_fid = npc_fid
-                                    found_cond_spk = True
-                                    break
-                        if not found_cond_spk:
-                            if alias_id != 0:  # skip empty 0 padding matches
-                                speaker_name = f"Alias_{alias_id}"
-                                found_cond_spk = True
-
-                # 5. DIAL GetIsAlias
-                if not found_cond_spk and dial_aliases:
-                    for alias_id in dial_aliases:
-                        if found_cond_spk:
-                            break
-                        quest_id = dial_dict.get("quest")
-                        if quest_id and quest_id in self.quests:
-                            q = self.quests[quest_id]
-                            npc_fid = q.get("alias_npcs", {}).get(alias_id)
-                            if npc_fid:
-                                speaker_name = self.get_npc_name(npc_fid)
-                                speaker_fid = npc_fid
-                                found_cond_spk = True
-                            if not found_cond_spk:
-                                aname = q.get("aliases", {}).get(alias_id)
-                                if aname:
-                                    speaker_name = aname
-                                    found_cond_spk = True
-                        if not found_cond_spk:
-                            for s_actors in self.scenes_actors.values():
-                                if alias_id in s_actors:
-                                    npc_fid = s_actors[alias_id]
-                                    speaker_name = self.get_npc_name(npc_fid)
-                                    speaker_fid = npc_fid
-                                    found_cond_spk = True
-                                    break
-                        if not found_cond_spk:
-                            if alias_id != 0:
-                                speaker_name = f"Alias_{alias_id}"
-                                found_cond_spk = True
-
-                # 6. INFO GetIsVoiceType (목소리 타입으로 화자 유추)
-                if not found_cond_spk and info.get("VoiceTypes"):
-                    vtyp_id = info["VoiceTypes"][0]
-                    speaker_name = f"VoiceType_{vtyp_id:08X}"
-                    found_cond_spk = True
-
-                # 7. INFO GetInFaction (소속 팩션으로 화자 유추)
-                if not found_cond_spk and info.get("Factions"):
-                    fact_id = info["Factions"][0]
-                    speaker_name = f"Faction_{fact_id:08X}"
-                    speaker_fid = fact_id
-                    found_cond_spk = True
-
+            speaker_name, speaker_fid, evidence = self._resolve_info_speaker(info, dial_dict)
             info["_resolved_speaker"] = speaker_name or "Unknown"
             info["_resolved_speaker_fid"] = speaker_fid
+            info["_speaker_evidence"] = evidence
 
         # 2. DIAL별 최다 화자 상속 휴리스틱
         dial_speakers = {}
@@ -1021,10 +1068,17 @@ class StarfieldSceneExtractor:
 
                     most_common = Counter(dial_speakers[pd]).most_common(1)[0][0]
                     info["_resolved_speaker"] = most_common
-                else:
-                    # DIAL 내에 NPC 화자가 확인되지 않는다면, 이는 플레이어의 선택지인 경우가 대부분입니다.
+                    info["_speaker_evidence"] = {
+                        **info.get("_speaker_evidence", {}),
+                        "inherited_from_dial_majority": most_common,
+                    }
+                elif info.get("IsPrompt"):
                     info["_resolved_speaker"] = "Player"
                     info["_resolved_speaker_fid"] = 7
+                    info["_speaker_evidence"] = {
+                        **info.get("_speaker_evidence", {}),
+                        "reasons": info.get("_speaker_evidence", {}).get("reasons", []) + ["IsPrompt fallback -> Player"],
+                    }
 
         quest_groups = {}
         def get_quest_group(qid: int):
@@ -1077,6 +1131,32 @@ class StarfieldSceneExtractor:
 
                     speaker_name = info.get("_resolved_speaker", "Unknown")
                     speaker_fid = info.get("_resolved_speaker_fid")
+                    if speaker_name == "Unknown" and not info.get("IsPrompt"):
+                        scene_actor_name, scene_actor_fid, scene_actor_meta = self._single_scene_actor_candidate(scen_id)
+                        if scene_actor_name:
+                            speaker_name = scene_actor_name
+                            speaker_fid = scene_actor_fid
+                            info["_resolved_speaker"] = speaker_name
+                            info["_resolved_speaker_fid"] = speaker_fid
+                            info["_speaker_evidence"] = {
+                                "player_score": info.get("_speaker_evidence", {}).get("player_score", 0),
+                                "npc_score": 4,
+                                "reasons": [f"single SCEN actor direct {scen_id:08X} +4"],
+                                **scene_actor_meta,
+                            }
+                    if speaker_name == "Unknown" and not info.get("IsPrompt"):
+                        quest_alias_name, quest_alias_fid, quest_alias_meta = self._single_quest_alias_candidate(dial_dict.get("quest"))
+                        if quest_alias_name:
+                            speaker_name = quest_alias_name
+                            speaker_fid = quest_alias_fid
+                            info["_resolved_speaker"] = speaker_name
+                            info["_resolved_speaker_fid"] = speaker_fid
+                            info["_speaker_evidence"] = {
+                                "player_score": info.get("_speaker_evidence", {}).get("player_score", 0),
+                                "npc_score": 2,
+                                "reasons": [f"single QUST alias direct {dial_dict.get('quest') or 0:08X} +2"],
+                                **quest_alias_meta,
+                            }
                     
                     audio_speaker = "unknown"
                     if speaker_fid:
@@ -1091,17 +1171,24 @@ class StarfieldSceneExtractor:
                         audio_speaker = speaker_name.replace(" ", "").lower()
 
                     for line_order, txt in enumerate(texts_data):
+                        field_type = txt.get("FieldType", "NAM1")
+                        line_speaker = "Player" if field_type == "RNAM" else speaker_name
+                        line_speaker_fid = 7 if field_type == "RNAM" else speaker_fid
                         dialogue_entry = {
                             "FormID": f"{info['FormID']:08X}",
                             "StringID": f"{txt['StringID']:08X}" if txt.get('StringID') else "00000000",
-                            "Speaker": speaker_name,
-                            "Text": txt.get("Text", "")
+                            "Speaker": line_speaker,
+                            "Text": txt.get("Text", ""),
+                            "FieldType": field_type,
+                            "InfoPNAM": f"{info['PNAM']:08X}" if info.get("PNAM") else "",
+                            "LinkedTopics": [f"{topic_id:08X}" for topic_id in info.get("LinkedTopics", []) if topic_id],
+                            "SpeakerEvidence": info.get("_speaker_evidence", {}),
                         }
                         add_item_contract(
                             dialogue_entry,
                             plugin_name=self.mod_stem,
                             record_type="INFO",
-                            subrecord_path="NAM1",
+                            subrecord_path=field_type,
                             field_index=line_order,
                             quest_id=f"{dial_dict.get('quest') or 0:08X}",
                             scene_id=f"{scen_id:08X}",
@@ -1129,7 +1216,11 @@ class StarfieldSceneExtractor:
                                 # [DEBUG] FormID: {info['FormID']:08X} (Prefix: {prefix:02X}) -> Owner: {owner_master}
                                 info["_debug_logged"] = True
 
-                            dialogue_entry["AudioPath"] = f"sound\\voice\\{owner_master}\\{audio_speaker}\\{wem_id.lower()}.wem"
+                            if line_speaker_fid == 7:
+                                audio_speaker_for_line = "player"
+                            else:
+                                audio_speaker_for_line = audio_speaker
+                            dialogue_entry["AudioPath"] = f"sound\\voice\\{owner_master}\\{audio_speaker_for_line}\\{wem_id.lower()}.wem"
                         dialogues.append(dialogue_entry)
 
                 if dialogues:
@@ -1174,7 +1265,7 @@ class StarfieldSceneExtractor:
 
                 speaker_name = info.get("_resolved_speaker", "Unknown")
                 speaker_fid = info.get("_resolved_speaker_fid")
-                if speaker_name == "Unknown" and not has_npc_speaker:
+                if speaker_name == "Unknown" and info.get("IsPrompt"):
                     speaker_name = "Player (Inferred)"
                     speaker_fid = 7
 
@@ -1191,17 +1282,24 @@ class StarfieldSceneExtractor:
                     audio_speaker = speaker_name.replace(" ", "").lower()
 
                 for line_order, txt in enumerate(texts_data):
+                    field_type = txt.get("FieldType", "NAM1")
+                    line_speaker = "Player" if field_type == "RNAM" else speaker_name
+                    line_speaker_fid = 7 if field_type == "RNAM" else speaker_fid
                     dialogue_entry = {
                         "FormID": f"{info['FormID']:08X}",
                         "StringID": f"{txt['StringID']:08X}" if txt.get('StringID') else "00000000",
-                        "Speaker": speaker_name,
-                        "Text": txt.get("Text", "")
+                        "Speaker": line_speaker,
+                        "Text": txt.get("Text", ""),
+                        "FieldType": field_type,
+                        "InfoPNAM": f"{info['PNAM']:08X}" if info.get("PNAM") else "",
+                        "LinkedTopics": [f"{topic_id:08X}" for topic_id in info.get("LinkedTopics", []) if topic_id],
+                        "SpeakerEvidence": info.get("_speaker_evidence", {}),
                     }
                     add_item_contract(
                         dialogue_entry,
                         plugin_name=self.mod_stem,
                         record_type="INFO",
-                        subrecord_path="NAM1",
+                        subrecord_path=field_type,
                         field_index=line_order,
                         quest_id=f"{quest_id or 0:08X}",
                         topic_id=f"{dial_id:08X}",
@@ -1224,7 +1322,11 @@ class StarfieldSceneExtractor:
                             owner_master = "starfield.esm"
                             wem_id = f"{audio_id:08X}"
                             
-                        dialogue_entry["AudioPath"] = f"sound\\voice\\{owner_master}\\{audio_speaker}\\{wem_id.lower()}.wem"
+                        if line_speaker_fid == 7:
+                            audio_speaker_for_line = "player"
+                        else:
+                            audio_speaker_for_line = audio_speaker
+                        dialogue_entry["AudioPath"] = f"sound\\voice\\{owner_master}\\{audio_speaker_for_line}\\{wem_id.lower()}.wem"
                     dialogues.append(dialogue_entry)
 
             if dialogues:

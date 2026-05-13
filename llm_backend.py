@@ -19,6 +19,8 @@ load_dotenv()
 
 log = logging.getLogger("LLMBackend")
 
+LOCAL_DUMMY_KEY = "PLACEHOLDER_LOCAL_LLM"
+
 ROLE_KEY_MAP = {
     "audio_profile": "models.audio_profile",
     "translation":   "models.translation",
@@ -95,8 +97,8 @@ class VertexBackend(BaseLLMBackend):
                 new_regions = set(constants.SUPPORTED_REGIONS)
                 new_regions.add(location)
                 constants.SUPPORTED_REGIONS = frozenset(new_regions)
-        except:
-            pass
+        except Exception as exc:
+            log.debug(f"Vertex SDK 리전 목록 패치 스킵: {exc}")
             
         # 방법 2 적용: api_endpoint를 직접 지정하여 global 리전 접속 보장
         endpoint = "global-aiplatform.googleapis.com" if location == "global" else f"{location}-aiplatform.googleapis.com"
@@ -357,7 +359,7 @@ class LocalLLMBackend(BaseLLMBackend):
     def __init__(self, base_url, api_key, model_name, system_instruction, max_retries=3, retry_base_wait=60):
         super().__init__(model_name, system_instruction, max_retries, retry_base_wait)
         import openai
-        self.client = openai.OpenAI(base_url=base_url, api_key=api_key or "sk-localllm")
+        self.client = openai.OpenAI(base_url=base_url, api_key=api_key or LOCAL_DUMMY_KEY)
         
     def generate_content(self, prompt: str, temperature=0.3, max_output_tokens=8192) -> str | None:
         last_exc = None
@@ -493,8 +495,8 @@ class Min1AIBackend(BaseLLMBackend):
                             current_total = json.load(f).get("total", 0)
                     with open(session_file, "w", encoding="utf-8") as f:
                         json.dump({"total": current_total + batch_credit}, f)
-                except:
-                    pass
+                except Exception as e:
+                    log.debug(f"1min.ai 세션 크레딧 기록 실패: {e}")
 
                 # 최종 텍스트 추출
                 content = self._extract_text_response(data)
@@ -512,7 +514,8 @@ class Min1AIBackend(BaseLLMBackend):
                     try:
                         err_body = e.response.json()
                         log.error(f"1min.ai API 상세 에러 (HTTP {e.response.status_code}) [Model: {self.model_name}]: {err_body}")
-                    except:
+                    except Exception as parse_exc:
+                        log.debug(f"1min.ai JSON 에러 본문 파싱 실패: {parse_exc}")
                         log.error(f"1min.ai API 상세 에러 (HTTP {e.response.status_code}) [Model: {self.model_name}]: {e.response.text}")
                 
                 # 재시도 조건 판별
@@ -602,7 +605,7 @@ def _deobfuscate(text: str) -> str:
         key = "STARFIELD"
         deobfuscated = "".join(chr(ord(c) ^ ord(key[i % len(key)])) for i, c in enumerate(decoded))
         return deobfuscated
-    except:
+    except Exception:
         return text
 
 def get_llm_backend(config_dict, step_prompt_key, role=None, max_retries=3, retry_base_wait=60):

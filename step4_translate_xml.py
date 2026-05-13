@@ -7,6 +7,7 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple
 
 from db_manager import DBRAG, load_glossary_db
@@ -38,7 +39,8 @@ class Config:
     MODEL_NAME = "gemini-2.5-flash"
 
     BATCH_SIZE = 20
-    RPM_DELAY = 0.5
+    RPM_DELAY = 0.0
+    STEP4_WORKERS = 4
     MAX_RETRIES = 3
     RETRY_BASE_WAIT = 60
 
@@ -66,8 +68,10 @@ if CONFIG_PATH.exists():
             Config.GCP_LOCATION = _cfg.get("gcp_location", Config.GCP_LOCATION)
             Config.MODEL_NAME = _cfg.get("model_name", Config.MODEL_NAME)
             Config.STEP4_PROMPT = _cfg.get("step4_prompt", Config.STEP4_PROMPT)
-    except:
-        pass
+            Config.RPM_DELAY = float(_cfg.get("step4_rpm_delay", Config.RPM_DELAY))
+            Config.STEP4_WORKERS = max(1, int(_cfg.get("step4_workers", Config.STEP4_WORKERS)))
+    except Exception as exc:
+        logging.getLogger("Step4_Mapper").debug(f"config.json 로드 실패, 기본 설정 사용: {exc}")
 
 # =============================================================================
 # 로거 설정
@@ -427,6 +431,17 @@ def translate_batch_llm(needs: list, backend, current_depth=0) -> list:
     return original_texts
 
 
+def translate_batch_chunk(chunk_index: int, chunk: list, backend) -> tuple[int, list]:
+    llm_needs = [(src, elems[0][1], elems[0][2]) for src, elems in chunk]
+    return chunk_index, translate_batch_llm(llm_needs, backend)
+
+
+def translate_vip_item(item_index: int, src_text: str, elements: list, backend) -> tuple[int, str]:
+    rec_val = elements[0][1]
+    ja_val = elements[0][2]
+    return item_index, translate_single_item(src_text, rec_val, backend, ja=ja_val)
+
+
 # =============================================================================
 # 종료 처리 핸들러
 # =============================================================================
@@ -614,47 +629,60 @@ def main():
     global b_stop_requested
 
     # --- 1. 단문 배치 처리 루프 ---
-    for i in range(0, len(batch_queue), Config.BATCH_SIZE):
-        if b_stop_requested:
-            break
+    batch_chunks = [
+        batch_queue[i : i + Config.BATCH_SIZE]
+        for i in range(0, len(batch_queue), Config.BATCH_SIZE)
+    ]
+    step4_workers = min(Config.STEP4_WORKERS, max(1, len(batch_chunks) + len(single_queue)))
+    log.info(f"Step4 병렬 처리 workers={step4_workers}")
 
-        chunk = batch_queue[i : i + Config.BATCH_SIZE]
-        log.info(
-            f"Batch Processing [{i + 1} ~ {min(i + Config.BATCH_SIZE, len(batch_queue))} / {len(batch_queue)}]..."
-        )
-
-        # LLM에게는 묶음의 첫 번째 요소의 REC 및 JA 정보만 대표로 보냄
-        llm_needs = [(src, elems[0][1], elems[0][2]) for src, elems in chunk]
-        translated_results = translate_batch_llm(llm_needs, backend)
-
-        # [Step 5 핵심] 한 번 번역된 결과를 똑같은 원문을 가진 모든 XML 태그에 일괄 복사!
-        for (src_text, elements), trans_text in zip(chunk, translated_results):
-            for dst_elem, _, _ in elements:
-                dst_elem.text = trans_text
-
-        time.sleep(Config.RPM_DELAY)
-        if i > 0 and i % (Config.BATCH_SIZE * 5) == 0:
-            tree.write(str(progress_path), encoding="utf-8", xml_declaration=True)
+    completed_batches = 0
+    if batch_chunks:
+        with ThreadPoolExecutor(max_workers=step4_workers) as executor:
+            futures = {
+                executor.submit(translate_batch_chunk, idx, chunk, backend): (idx, chunk)
+                for idx, chunk in enumerate(batch_chunks)
+                if not b_stop_requested
+            }
+            for future in as_completed(futures):
+                if b_stop_requested:
+                    break
+                idx, chunk = futures[future]
+                _, translated_results = future.result()
+                log.info(
+                    f"Batch Completed [{idx * Config.BATCH_SIZE + 1} ~ {min((idx + 1) * Config.BATCH_SIZE, len(batch_queue))} / {len(batch_queue)}]"
+                )
+                for (src_text, elements), trans_text in zip(chunk, translated_results):
+                    for dst_elem, _, _ in elements:
+                        dst_elem.text = trans_text
+                completed_batches += 1
+                if Config.RPM_DELAY > 0:
+                    time.sleep(Config.RPM_DELAY)
+                if completed_batches % 5 == 0:
+                    tree.write(str(progress_path), encoding="utf-8", xml_declaration=True)
 
     # --- 2. 장문(VIP) 단독 처리 루프 ---
-    for i, (src_text, elements) in enumerate(single_queue):
-        if b_stop_requested:
-            break
-
-        log.info(
-            f"VIP Long-Text Processing [{i + 1} / {len(single_queue)}]: {src_text[:40]}..."
-        )
-
-        rec_val = elements[0][1]  # 대표 REC
-        ja_val = elements[0][2]  # 대표 JA
-        trans_text = translate_single_item(src_text, rec_val, backend, ja=ja_val)
-
-        for dst_elem, _, _ in elements:
-            dst_elem.text = trans_text
-
-        time.sleep(Config.RPM_DELAY)
-        if i > 0 and i % 10 == 0:
-            tree.write(str(progress_path), encoding="utf-8", xml_declaration=True)
+    completed_vips = 0
+    if single_queue and not b_stop_requested:
+        with ThreadPoolExecutor(max_workers=step4_workers) as executor:
+            futures = {
+                executor.submit(translate_vip_item, idx, src_text, elements, backend): (idx, src_text, elements)
+                for idx, (src_text, elements) in enumerate(single_queue)
+                if not b_stop_requested
+            }
+            for future in as_completed(futures):
+                if b_stop_requested:
+                    break
+                idx, src_text, elements = futures[future]
+                _, trans_text = future.result()
+                log.info(f"VIP Long-Text Completed [{idx + 1} / {len(single_queue)}]: {src_text[:40]}...")
+                for dst_elem, _, _ in elements:
+                    dst_elem.text = trans_text
+                completed_vips += 1
+                if Config.RPM_DELAY > 0:
+                    time.sleep(Config.RPM_DELAY)
+                if completed_vips % 10 == 0:
+                    tree.write(str(progress_path), encoding="utf-8", xml_declaration=True)
 
     # -------------------------------------------------------------
     # 💾 최종 마무리 및 저장
